@@ -13,3 +13,7 @@ const (
 func E() Environment {
 	return Environment(os.Getenv("ENV"))
 }
+
+func FromString(s string) Environment {
+	return Environment(s)
+}
