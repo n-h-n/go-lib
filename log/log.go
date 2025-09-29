@@ -174,6 +174,11 @@ func (w ScopedLogger) Panicf(ctx context.Context, pattern string, args ...any) {
 	}
 }
 
+// Sync flushes any buffered log entries
+func (w ScopedLogger) Sync() error {
+	return w.SugaredLogger.Sync()
+}
+
 func init() {
 	dl := &DynamicLevel{
 		Levels:       levels,
