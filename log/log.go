@@ -2,6 +2,7 @@ package log
 
 import (
 	"context"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -31,10 +32,41 @@ var (
 	}
 )
 
+// CustomEncoderConfig creates a human-readable log format
+func CustomEncoderConfig() zapcore.EncoderConfig {
+	return zapcore.EncoderConfig{
+		TimeKey:        "ts",
+		LevelKey:       "level",
+		NameKey:        "logger",
+		CallerKey:      "caller",
+		MessageKey:     "msg",
+		StacktraceKey:  "stacktrace",
+		LineEnding:     zapcore.DefaultLineEnding,
+		EncodeLevel:    zapcore.CapitalLevelEncoder,
+		EncodeTime:     CustomTimeEncoder,
+		EncodeDuration: zapcore.SecondsDurationEncoder,
+		EncodeCaller:   zapcore.ShortCallerEncoder,
+	}
+}
+
+// CustomTimeEncoder formats timestamps as "2006-01-02 15:04:05"
+func CustomTimeEncoder(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
+	enc.AppendString(t.Format("2006-01-02 15:04:05"))
+}
+
 func NewEnvLogger(options ...zap.Option) *zap.SugaredLogger {
-	cfg := zap.NewProductionConfig()
+	var cfg zap.Config
+
 	if env.E() == env.Local || env.E() == env.Dev {
 		cfg = zap.NewDevelopmentConfig()
+		// Override with custom encoder for human-readable format
+		cfg.EncoderConfig = CustomEncoderConfig()
+		cfg.Encoding = "console"
+	} else {
+		cfg = zap.NewProductionConfig()
+		// Override with custom encoder for human-readable format
+		cfg.EncoderConfig = CustomEncoderConfig()
+		cfg.Encoding = "console"
 	}
 
 	// Fix for ISS-8444 - Set the log level to the minimum so that dynamic-logger could work
