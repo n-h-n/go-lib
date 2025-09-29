@@ -7,7 +7,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	awsSecretsmanager "github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 )
 
 // SecretFetcher defines the interface for fetching secrets
@@ -27,10 +27,10 @@ func (f *AWSSecretFetcher) FetchSecret(ctx context.Context, secretKey string) ([
 	}
 
 	// Create Secrets Manager client
-	client := secretsmanager.NewFromConfig(cfg)
+	client := awsSecretsmanager.NewFromConfig(cfg)
 
 	// Fetch the secret from AWS Secrets Manager
-	input := &secretsmanager.GetSecretValueInput{
+	input := &awsSecretsmanager.GetSecretValueInput{
 		SecretId: aws.String(secretKey),
 	}
 
