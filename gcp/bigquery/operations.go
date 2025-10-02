@@ -308,7 +308,23 @@ func (c *Client) AlterTableAddColumns(table *Table) error {
 		currentColumns[field.Name] = true
 	}
 
-	var newFields []*bigquery.FieldSchema
+	// Build complete schema: existing fields + new fields
+	var allFields []*bigquery.FieldSchema
+
+	// Add existing fields first
+	for _, field := range currentSchema.Fields {
+		existingField := &bigquery.FieldSchema{
+			Name:        field.Name,
+			Type:        bigquery.FieldType(field.Type),
+			Repeated:    field.Mode == "REPEATED",
+			Required:    field.Mode == "REQUIRED",
+			Description: field.Description,
+		}
+		allFields = append(allFields, existingField)
+	}
+
+	// Add new fields
+	var newFieldsCount int
 	for _, column := range *table.Columns {
 		if !currentColumns[column.Name] {
 			// New column, add to schema
@@ -319,21 +335,22 @@ func (c *Client) AlterTableAddColumns(table *Table) error {
 				Required:    column.Mode == "REQUIRED",
 				Description: column.Description,
 			}
-			newFields = append(newFields, field)
+			allFields = append(allFields, field)
+			newFieldsCount++
 		}
 	}
 
-	if len(newFields) == 0 {
+	if newFieldsCount == 0 {
 		if c.verboseMode {
 			log.Log.Debugf(c.ctx, "no new columns to add to table %s", table.Name)
 		}
 		return nil
 	}
 
-	// Update table schema
+	// Update table schema with complete schema
 	tableRef := c.GetTableReference(table.Name)
 	update := bigquery.TableMetadataToUpdate{
-		Schema: newFields,
+		Schema: allFields,
 	}
 
 	_, err = tableRef.Update(c.ctx, update, "")
