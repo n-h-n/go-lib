@@ -189,6 +189,15 @@ func (c *Client) AlignTableSchema(table *Table, opts ...func(*alignTableOpts)) e
 		return fmt.Errorf("unable to align table schema: table cannot be nil")
 	}
 
+	o := alignTableOpts{
+		nullAlignment:   false,
+		allowRecreation: false, // Default to false for safety
+	}
+
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	// Check if table exists
 	exists, err := c.IsTableExistent(table)
 	if err != nil {
@@ -201,6 +210,7 @@ func (c *Client) AlignTableSchema(table *Table, opts ...func(*alignTableOpts)) e
 		if err = c.CreateTable(table); err != nil {
 			return fmt.Errorf("could not create table: %w", err)
 		}
+		return nil
 	}
 
 	// Check if schema is aligned
@@ -210,8 +220,29 @@ func (c *Client) AlignTableSchema(table *Table, opts ...func(*alignTableOpts)) e
 	}
 
 	if !aligned {
-		if err = c.AlterTableAddColumns(table); err != nil {
-			return fmt.Errorf("could not add columns: %w", err)
+		// Check if we need to recreate the table (column removal/type changes)
+		needsRecreation, err := c.needsTableRecreation(table)
+		if err != nil {
+			return fmt.Errorf("could not check if table needs recreation: %w", err)
+		}
+
+		if needsRecreation {
+			if !o.allowRecreation {
+				return fmt.Errorf("table %s requires recreation (column removal or type changes detected) but recreation is not allowed. Use WithAlignTableRecreation(true) to enable", table.Name)
+			}
+
+			if c.verboseMode {
+				log.Log.Debugf(c.ctx, "table %s needs recreation due to column removal or type changes", table.Name)
+			}
+			// Recreate the table with new schema
+			if err = c.CreateTable(table, WithCreateTableOverwrite(true)); err != nil {
+				return fmt.Errorf("could not recreate table: %w", err)
+			}
+		} else {
+			// Only adding new columns
+			if err = c.AlterTableAddColumns(table); err != nil {
+				return fmt.Errorf("could not add columns: %w", err)
+			}
 		}
 	}
 
@@ -284,6 +315,52 @@ func (c *Client) IsSchemaAligned(table *Table, opts ...func(*alignTableOpts)) (b
 	}
 
 	return aligned, nil
+}
+
+// needsTableRecreation checks if the table needs to be recreated due to column removal or type changes
+func (c *Client) needsTableRecreation(table *Table) (bool, error) {
+	// Get current schema
+	currentSchema, err := c.GetTableSchema(table.Name)
+	if err != nil {
+		return false, fmt.Errorf("could not get current schema: %w", err)
+	}
+
+	// Convert current schema to our table format
+	currentTable, err := convertFromBigQuerySchema(currentSchema)
+	if err != nil {
+		return false, fmt.Errorf("could not convert current schema: %w", err)
+	}
+
+	// Check if any current columns are missing in the new schema (column removal)
+	for colName := range *currentTable.Columns {
+		if _, exists := (*table.Columns)[colName]; !exists {
+			if c.verboseMode {
+				log.Log.Debugf(c.ctx, "column %s exists in current table but not in new schema - recreation needed", colName)
+			}
+			return true, nil
+		}
+	}
+
+	// Check if any existing columns have type changes
+	for colName, newCol := range *table.Columns {
+		if currentCol, exists := (*currentTable.Columns)[colName]; exists {
+			if currentCol.Type != newCol.Type {
+				if c.verboseMode {
+					log.Log.Debugf(c.ctx, "column %s type changed from %s to %s - recreation needed", colName, currentCol.Type, newCol.Type)
+				}
+				return true, nil
+			}
+			// Check mode changes that require recreation (e.g., REQUIRED to NULLABLE)
+			if currentCol.Mode != newCol.Mode {
+				if c.verboseMode {
+					log.Log.Debugf(c.ctx, "column %s mode changed from %s to %s - recreation needed", colName, currentCol.Mode, newCol.Mode)
+				}
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
 }
 
 // AlterTableAddColumns adds columns to an existing table
@@ -715,11 +792,14 @@ func (c *Client) ViewExists(viewName string) (bool, error) {
 	return true, nil
 }
 
-// CreateIndex creates clustering for a BigQuery table
-func (c *Client) CreateIndex(table *Table, cols *[]Column, opts ...func(*indexOpts)) error {
+// CreateIndex creates clustering or partitioning for a BigQuery table
+func (c *Client) CreateIndex(table *Table, opts ...func(*indexOpts)) error {
 	o := indexOpts{
-		recreate: false,
-		typ:      IndexTypeClustering,
+		recreate:          false,
+		typ:               IndexTypeClustering,
+		clusteringFields:  []string{},
+		timePartitioning:  nil,
+		rangePartitioning: nil,
 	}
 
 	for _, opt := range opts {
@@ -730,92 +810,248 @@ func (c *Client) CreateIndex(table *Table, cols *[]Column, opts ...func(*indexOp
 		return fmt.Errorf("unable to create index: table and table.Name cannot be zero values")
 	}
 
-	if len(*cols) == 0 {
-		return fmt.Errorf("unable to create index: no columns to index provided")
+	// Validate that we have something to create
+	if o.typ == IndexTypeClustering && len(o.clusteringFields) == 0 {
+		return fmt.Errorf("unable to create clustering index: no clustering fields provided")
+	}
+	if o.typ == IndexTypePartition && o.timePartitioning == nil && o.rangePartitioning == nil {
+		return fmt.Errorf("unable to create partition index: no partitioning configuration provided")
+	}
+	if o.typ == IndexTypeSearch && o.searchIndex == nil {
+		return fmt.Errorf("unable to create search index: no search index configuration provided")
+	}
+	if o.typ == IndexTypeVector && o.vectorIndex == nil {
+		return fmt.Errorf("unable to create vector index: no vector index configuration provided")
 	}
 
-	// Check if clustering already exists
-	exists, err := c.IsIndexExistent(table, cols)
+	// Check if index already exists
+	exists, err := c.IsIndexExistent(table, &o)
 	if err != nil {
 		return fmt.Errorf("could not check if index exists: %w", err)
 	}
 
 	if exists && !o.recreate {
 		if c.verboseMode {
-			log.Log.Debugf(c.ctx, "clustering already exists for table %s, option to recreate not specified, skipping", table.Name)
+			log.Log.Debugf(c.ctx, "%s already exists for table %s, option to recreate not specified, skipping", o.typ, table.Name)
 		}
 		return nil
 	}
 
 	if exists && o.recreate {
 		if c.verboseMode {
-			log.Log.Debugf(c.ctx, "recreating clustering for table %s", table.Name)
+			log.Log.Debugf(c.ctx, "recreating %s for table %s", o.typ, table.Name)
 		}
-		if err = c.DropIndex(table, cols); err != nil {
+		if err = c.DropIndex(table, &o); err != nil {
 			return fmt.Errorf("could not drop index: %w", err)
 		}
 	}
 
 	if c.verboseMode {
-		log.Log.Debugf(c.ctx, "creating clustering for table %s", table.Name)
+		log.Log.Debugf(c.ctx, "creating %s for table %s", o.typ, table.Name)
 	}
 
-	// Get column names for clustering
-	columnNames := []string{}
-	for _, col := range *cols {
-		columnNames = append(columnNames, col.Name)
-	}
+	// Create the index based on type
+	switch o.typ {
+	case IndexTypeClustering:
+		// Handle clustering via table metadata update
+		tableRef := c.GetTableReference(table.Name)
+		update := bigquery.TableMetadataToUpdate{
+			Clustering: &bigquery.Clustering{
+				Fields: o.clusteringFields,
+			},
+		}
+		_, err = tableRef.Update(c.ctx, update, "")
+		if err != nil {
+			return fmt.Errorf("could not create %s: %w", o.typ, err)
+		}
 
-	// Update table with clustering
-	tableRef := c.GetTableReference(table.Name)
-	update := bigquery.TableMetadataToUpdate{
-		Clustering: &bigquery.Clustering{
-			Fields: columnNames,
-		},
-	}
+	case IndexTypePartition:
+		// Handle partitioning via table metadata update
+		tableRef := c.GetTableReference(table.Name)
+		update := bigquery.TableMetadataToUpdate{}
+		if o.timePartitioning != nil {
+			update.TimePartitioning = &bigquery.TimePartitioning{
+				Type:       bigquery.TimePartitioningType(o.timePartitioning.Type),
+				Field:      o.timePartitioning.Field,
+				Expiration: time.Duration(o.timePartitioning.ExpirationMs) * time.Millisecond,
+			}
+		}
+		// Note: BigQuery Go client doesn't support RangePartitioning in TableMetadataToUpdate
+		// Range partitioning must be set during table creation
+		if o.rangePartitioning != nil {
+			return fmt.Errorf("range partitioning cannot be added to existing tables - must be set during table creation")
+		}
+		_, err = tableRef.Update(c.ctx, update, "")
+		if err != nil {
+			return fmt.Errorf("could not create %s: %w", o.typ, err)
+		}
 
-	_, err = tableRef.Update(c.ctx, update, "")
-	if err != nil {
-		return fmt.Errorf("could not create clustering: %w", err)
+	case IndexTypeSearch:
+		// Handle search index via DDL
+		err = c.createSearchIndex(table, o.searchIndex)
+		if err != nil {
+			return fmt.Errorf("could not create search index: %w", err)
+		}
+
+	case IndexTypeVector:
+		// Handle vector index via DDL
+		err = c.createVectorIndex(table, o.vectorIndex)
+		if err != nil {
+			return fmt.Errorf("could not create vector index: %w", err)
+		}
+
+	default:
+		return fmt.Errorf("unsupported index type: %s", o.typ)
 	}
 
 	if c.verboseMode {
-		log.Log.Debugf(c.ctx, "created clustering for table %s", table.Name)
+		log.Log.Debugf(c.ctx, "created %s for table %s", o.typ, table.Name)
 	}
 
 	return nil
 }
 
-// DropIndex drops clustering from a BigQuery table
-func (c *Client) DropIndex(table *Table, cols *[]Column) error {
+// createSearchIndex creates a search index using DDL
+func (c *Client) createSearchIndex(table *Table, config *SearchIndexConfig) error {
+	var columnsClause string
+	if config.IndexAllColumns {
+		columnsClause = "ALL COLUMNS"
+	} else if len(config.Columns) > 0 {
+		columnsClause = fmt.Sprintf("(%s)", strings.Join(config.Columns, ", "))
+	} else {
+		return fmt.Errorf("search index must specify either columns or IndexAllColumns=true")
+	}
+
+	query := fmt.Sprintf(`
+		CREATE SEARCH INDEX %s
+		ON %s.%s.%s %s
+	`, config.Name, c.projectID, c.datasetID, table.Name, columnsClause)
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "executing search index DDL: %s", query)
+	}
+
+	err := c.ExecuteDML(c.ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to create search index: %w", err)
+	}
+
+	return nil
+}
+
+// createVectorIndex creates a vector index using DDL
+func (c *Client) createVectorIndex(table *Table, config *VectorIndexConfig) error {
+	query := fmt.Sprintf(`
+		CREATE VECTOR INDEX %s
+		ON %s.%s.%s (%s)
+	`, config.Name, c.projectID, c.datasetID, table.Name, config.Column)
+
+	// Add options if specified
+	if len(config.Options) > 0 || config.DistanceType != "" || config.Dimensions > 0 {
+		options := []string{}
+
+		if config.DistanceType != "" {
+			options = append(options, fmt.Sprintf("distance_type='%s'", config.DistanceType))
+		}
+
+		if config.Dimensions > 0 {
+			options = append(options, fmt.Sprintf("dimensions=%d", config.Dimensions))
+		}
+
+		// Add any additional options
+		for key, value := range config.Options {
+			options = append(options, fmt.Sprintf("%s='%v'", key, value))
+		}
+
+		if len(options) > 0 {
+			query += fmt.Sprintf("\nOPTIONS (%s)", strings.Join(options, ", "))
+		}
+	}
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "executing vector index DDL: %s", query)
+	}
+
+	err := c.ExecuteDML(c.ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to create vector index: %w", err)
+	}
+
+	return nil
+}
+
+// DropIndex drops clustering or partitioning from a BigQuery table
+func (c *Client) DropIndex(table *Table, opts *indexOpts) error {
 	if table == nil || table.Name == "" {
 		return fmt.Errorf("unable to drop index: table and table.Name cannot be zero values")
 	}
 
 	if c.verboseMode {
-		log.Log.Debugf(c.ctx, "dropping clustering for table %s", table.Name)
+		log.Log.Debugf(c.ctx, "dropping %s for table %s", opts.typ, table.Name)
 	}
 
-	// Remove clustering by setting it to nil
-	tableRef := c.GetTableReference(table.Name)
-	update := bigquery.TableMetadataToUpdate{
-		Clustering: &bigquery.Clustering{}, // Empty clustering removes it
-	}
+	// Remove index based on type
+	switch opts.typ {
+	case IndexTypeClustering:
+		tableRef := c.GetTableReference(table.Name)
+		update := bigquery.TableMetadataToUpdate{
+			Clustering: &bigquery.Clustering{}, // Empty clustering removes it
+		}
+		_, err := tableRef.Update(c.ctx, update, "")
+		if err != nil {
+			return fmt.Errorf("could not drop %s: %w", opts.typ, err)
+		}
 
-	_, err := tableRef.Update(c.ctx, update, "")
-	if err != nil {
-		return fmt.Errorf("could not drop clustering: %w", err)
+	case IndexTypePartition:
+		// Note: BigQuery doesn't allow removing partitioning from existing tables
+		// This would require table recreation
+		return fmt.Errorf("cannot drop partitioning from existing table %s - partitioning cannot be removed once set", table.Name)
+
+	case IndexTypeSearch:
+		if opts.searchIndex == nil || opts.searchIndex.Name == "" {
+			return fmt.Errorf("search index name is required for dropping")
+		}
+		query := fmt.Sprintf("DROP SEARCH INDEX %s ON %s.%s.%s",
+			opts.searchIndex.Name, c.projectID, c.datasetID, table.Name)
+
+		if c.verboseMode {
+			log.Log.Debugf(c.ctx, "executing drop search index DDL: %s", query)
+		}
+
+		err := c.ExecuteDML(c.ctx, query)
+		if err != nil {
+			return fmt.Errorf("could not drop search index: %w", err)
+		}
+
+	case IndexTypeVector:
+		if opts.vectorIndex == nil || opts.vectorIndex.Name == "" {
+			return fmt.Errorf("vector index name is required for dropping")
+		}
+		query := fmt.Sprintf("DROP VECTOR INDEX %s ON %s.%s.%s",
+			opts.vectorIndex.Name, c.projectID, c.datasetID, table.Name)
+
+		if c.verboseMode {
+			log.Log.Debugf(c.ctx, "executing drop vector index DDL: %s", query)
+		}
+
+		err := c.ExecuteDML(c.ctx, query)
+		if err != nil {
+			return fmt.Errorf("could not drop vector index: %w", err)
+		}
+
+	default:
+		return fmt.Errorf("unsupported index type: %s", opts.typ)
 	}
 
 	if c.verboseMode {
-		log.Log.Debugf(c.ctx, "dropped clustering for table %s", table.Name)
+		log.Log.Debugf(c.ctx, "dropped %s for table %s", opts.typ, table.Name)
 	}
 
 	return nil
 }
 
-// IsIndexExistent checks if clustering exists for a table
-func (c *Client) IsIndexExistent(table *Table, cols *[]Column) (bool, error) {
+// IsIndexExistent checks if clustering or partitioning exists for a table
+func (c *Client) IsIndexExistent(table *Table, opts *indexOpts) (bool, error) {
 	if table == nil || table.Name == "" {
 		return false, fmt.Errorf("unable to check if index exists: table and table.Name cannot be zero values")
 	}
@@ -826,28 +1062,117 @@ func (c *Client) IsIndexExistent(table *Table, cols *[]Column) (bool, error) {
 		return false, err
 	}
 
-	// Check if clustering exists and matches the requested columns
-	if metadata.Clustering == nil || len(metadata.Clustering.Fields) == 0 {
-		return false, nil
-	}
-
-	// Check if the clustering fields exactly match the requested columns
-	if len(metadata.Clustering.Fields) != len(*cols) {
-		return false, nil
-	}
-
-	requestedColumns := make(map[string]bool)
-	for _, col := range *cols {
-		requestedColumns[col.Name] = true
-	}
-
-	for _, field := range metadata.Clustering.Fields {
-		if !requestedColumns[field] {
+	switch opts.typ {
+	case IndexTypeClustering:
+		// Check if clustering exists and matches the requested fields
+		if metadata.Clustering == nil || len(metadata.Clustering.Fields) == 0 {
 			return false, nil
 		}
-	}
 
-	return true, nil
+		// Check if the clustering fields exactly match the requested fields
+		if len(metadata.Clustering.Fields) != len(opts.clusteringFields) {
+			return false, nil
+		}
+
+		requestedFields := make(map[string]bool)
+		for _, field := range opts.clusteringFields {
+			requestedFields[field] = true
+		}
+
+		for _, field := range metadata.Clustering.Fields {
+			if !requestedFields[field] {
+				return false, nil
+			}
+		}
+
+		return true, nil
+
+	case IndexTypePartition:
+		// Check time partitioning
+		if opts.timePartitioning != nil {
+			if metadata.TimePartitioning == nil {
+				return false, nil
+			}
+			if string(metadata.TimePartitioning.Type) != opts.timePartitioning.Type {
+				return false, nil
+			}
+			if metadata.TimePartitioning.Field != opts.timePartitioning.Field {
+				return false, nil
+			}
+			return true, nil
+		}
+
+		// Check range partitioning
+		if opts.rangePartitioning != nil {
+			if metadata.RangePartitioning == nil {
+				return false, nil
+			}
+			if metadata.RangePartitioning.Field != opts.rangePartitioning.Field {
+				return false, nil
+			}
+			// Could add more detailed range comparison here if needed
+			return true, nil
+		}
+
+		return false, nil
+
+	case IndexTypeSearch:
+		// Check if search index exists by querying INFORMATION_SCHEMA
+		if opts.searchIndex == nil || opts.searchIndex.Name == "" {
+			return false, fmt.Errorf("search index name is required for existence check")
+		}
+
+		query := fmt.Sprintf(`
+			SELECT COUNT(*) as count
+			FROM %s.%s.INFORMATION_SCHEMA.SEARCH_INDEXES
+			WHERE table_name = '%s' AND index_name = '%s'
+		`, c.projectID, c.datasetID, table.Name, opts.searchIndex.Name)
+
+		it, err := c.ExecuteQuery(c.ctx, query)
+		if err != nil {
+			return false, fmt.Errorf("failed to check search index existence: %w", err)
+		}
+
+		var row struct {
+			Count int64 `bigquery:"count"`
+		}
+		err = it.Next(&row)
+		if err != nil {
+			return false, fmt.Errorf("failed to read search index count: %w", err)
+		}
+
+		return row.Count > 0, nil
+
+	case IndexTypeVector:
+		// Check if vector index exists by querying INFORMATION_SCHEMA
+		if opts.vectorIndex == nil || opts.vectorIndex.Name == "" {
+			return false, fmt.Errorf("vector index name is required for existence check")
+		}
+
+		query := fmt.Sprintf(`
+			SELECT COUNT(*) as count
+			FROM %s.%s.INFORMATION_SCHEMA.VECTOR_INDEXES
+			WHERE table_name = '%s' AND index_name = '%s'
+		`, c.projectID, c.datasetID, table.Name, opts.vectorIndex.Name)
+
+		it, err := c.ExecuteQuery(c.ctx, query)
+		if err != nil {
+			return false, fmt.Errorf("failed to check vector index existence: %w", err)
+		}
+
+		var row struct {
+			Count int64 `bigquery:"count"`
+		}
+		err = it.Next(&row)
+		if err != nil {
+			return false, fmt.Errorf("failed to read vector index count: %w", err)
+		}
+
+		return row.Count > 0, nil
+
+	default:
+		return false, fmt.Errorf("unsupported index type: %s", opts.typ)
+	}
 }
 
 // ########################################
@@ -855,12 +1180,20 @@ func (c *Client) IsIndexExistent(table *Table, cols *[]Column) (bool, error) {
 // ########################################
 
 type alignTableOpts struct {
-	nullAlignment bool
+	nullAlignment   bool
+	allowRecreation bool
 }
 
 func WithAlignTableNullability(v bool) func(*alignTableOpts) {
 	return func(opts *alignTableOpts) {
 		opts.nullAlignment = v
+	}
+}
+
+// WARNING: This option is dangerous and should only be used if you know what you are doing. It will drop and recreate the table.
+func WithAlignTableRecreation(v bool) func(*alignTableOpts) {
+	return func(opts *alignTableOpts) {
+		opts.allowRecreation = v
 	}
 }
 
@@ -913,8 +1246,13 @@ func WithDatasetDescription(description string) func(*createDatasetOpts) {
 }
 
 type indexOpts struct {
-	recreate bool
-	typ      indexType
+	recreate          bool
+	typ               indexType
+	clusteringFields  []string
+	timePartitioning  *TimePartitioning
+	rangePartitioning *RangePartitioning
+	searchIndex       *SearchIndexConfig
+	vectorIndex       *VectorIndexConfig
 }
 
 func WithRecreateIndex() func(*indexOpts) {
@@ -926,6 +1264,41 @@ func WithRecreateIndex() func(*indexOpts) {
 func WithIndexType(typ indexType) func(*indexOpts) {
 	return func(opts *indexOpts) {
 		opts.typ = typ
+	}
+}
+
+func WithClusteringFields(fields []string) func(*indexOpts) {
+	return func(opts *indexOpts) {
+		opts.typ = IndexTypeClustering
+		opts.clusteringFields = fields
+	}
+}
+
+func WithIndexTimePartitioning(tp *TimePartitioning) func(*indexOpts) {
+	return func(opts *indexOpts) {
+		opts.typ = IndexTypePartition
+		opts.timePartitioning = tp
+	}
+}
+
+func WithIndexRangePartitioning(rp *RangePartitioning) func(*indexOpts) {
+	return func(opts *indexOpts) {
+		opts.typ = IndexTypePartition
+		opts.rangePartitioning = rp
+	}
+}
+
+func WithSearchIndex(config *SearchIndexConfig) func(*indexOpts) {
+	return func(opts *indexOpts) {
+		opts.typ = IndexTypeSearch
+		opts.searchIndex = config
+	}
+}
+
+func WithVectorIndex(config *VectorIndexConfig) func(*indexOpts) {
+	return func(opts *indexOpts) {
+		opts.typ = IndexTypeVector
+		opts.vectorIndex = config
 	}
 }
 

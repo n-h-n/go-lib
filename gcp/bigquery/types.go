@@ -96,6 +96,22 @@ type ClusteringConfig struct {
 	Fields []string
 }
 
+// SearchIndexConfig represents search index configuration for text data
+type SearchIndexConfig struct {
+	Name            string   // Index name
+	Columns         []string // Columns to index for text search
+	IndexAllColumns bool     // Index all STRING columns if true
+}
+
+// VectorIndexConfig represents vector index configuration for ML embeddings
+type VectorIndexConfig struct {
+	Name         string                 // Index name
+	Column       string                 // Vector column name
+	Options      map[string]interface{} // Additional vector index options
+	DistanceType string                 // COSINE, EUCLIDEAN, DOT_PRODUCT
+	Dimensions   int                    // Vector dimensions (optional)
+}
+
 // TimePartitioning represents time-based partitioning
 type TimePartitioning struct {
 	Type         string
@@ -249,6 +265,8 @@ type indexType string
 const (
 	IndexTypeClustering indexType = "CLUSTERING"
 	IndexTypePartition  indexType = "PARTITION"
+	IndexTypeSearch     indexType = "SEARCH"
+	IndexTypeVector     indexType = "VECTOR"
 )
 
 type bigqueryType string
