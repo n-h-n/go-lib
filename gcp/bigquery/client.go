@@ -66,6 +66,12 @@ func NewClient(
 		return nil, fmt.Errorf("invalid dataset ID: %w", err)
 	}
 
+	// create dataset if it doesn't exist
+	err = c.CreateDataset(c.datasetID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dataset: %w", err)
+	}
+
 	var clientOptions []option.ClientOption
 
 	// Handle authentication
