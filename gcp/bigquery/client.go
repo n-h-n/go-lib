@@ -32,11 +32,13 @@ type Client struct {
 func NewClient(
 	ctx context.Context,
 	projectID string,
+	datasetID string,
 	opts ...clientOpt,
 ) (*Client, error) {
 	c := Client{
 		ctx:               ctx,
 		projectID:         projectID,
+		datasetID:         datasetID,
 		location:          "US",
 		verboseMode:       false,
 		jobTimeout:        300, // 5 minutes default
@@ -56,6 +58,12 @@ func NewClient(
 
 	if c.datasetID == "" {
 		return nil, fmt.Errorf("dataset ID is required")
+	}
+
+	// validate dataset ID name
+	err := validateDatasetName(c.datasetID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid dataset ID: %w", err)
 	}
 
 	var clientOptions []option.ClientOption

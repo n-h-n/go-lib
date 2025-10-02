@@ -37,11 +37,7 @@ func (c *Client) CreateTable(table *Table, opts ...func(*createTableOpts)) error
 		return nil
 	}
 
-	if c.verboseMode {
-		log.Log.Debugf(c.ctx, "creating table %s in dataset %s", table.Name, c.datasetID)
-	}
-
-	if createOpts.overwrite {
+	if exists && createOpts.overwrite {
 		if c.verboseMode {
 			log.Log.Debugf(c.ctx, "overwrite mode enabled; dropping table %s in %s", table.Name, c.datasetID)
 		}
@@ -49,6 +45,10 @@ func (c *Client) CreateTable(table *Table, opts ...func(*createTableOpts)) error
 		if err != nil {
 			return err
 		}
+	}
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "creating table %s in dataset %s", table.Name, c.datasetID)
 	}
 
 	// Convert to BigQuery schema
@@ -442,8 +442,8 @@ func (c *Client) DeleteRows(rows ...Row) error {
 		// Build DELETE query
 		cols := row.Columns()
 		colNames := utils.GetKeysFromMap(*cols)
-		values := []interface{}{}
 		whereClause := ""
+		params := make(map[string]interface{})
 
 		for _, colName := range colNames {
 			col := (*cols)[colName]
@@ -452,7 +452,7 @@ func (c *Client) DeleteRows(rows ...Row) error {
 					whereClause += " AND "
 				}
 				whereClause += fmt.Sprintf("%s = @%s", colName, colName)
-				values = append(values, col.Value)
+				params[colName] = col.Value
 			}
 		}
 
@@ -462,8 +462,8 @@ func (c *Client) DeleteRows(rows ...Row) error {
 
 		query := fmt.Sprintf("DELETE FROM `%s.%s.%s` WHERE %s", c.projectID, c.datasetID, table.Name, whereClause)
 
-		// Execute DELETE query
-		err = c.ExecuteDML(c.ctx, query)
+		// Execute DELETE query with parameters
+		_, err = c.QueryWithParams(query, params)
 		if err != nil {
 			return fmt.Errorf("failed to delete row (%s) in table (%s): %w", strings.Join(colNames, ", "), table.Name, err)
 		}
@@ -534,11 +534,23 @@ func (c *Client) CreateDataset(datasetID string, opts ...func(*createDatasetOpts
 	// Check if dataset already exists
 	datasetRef := c.client.Dataset(datasetID)
 	_, err := datasetRef.Metadata(c.ctx)
-	if err == nil && !createOpts.overwrite {
+	exists := (err == nil)
+
+	if exists && !createOpts.overwrite {
 		if c.verboseMode {
 			log.Log.Debugf(c.ctx, "dataset %s already exists, overwrite option is false, skipping", datasetID)
 		}
 		return nil
+	}
+
+	if exists && createOpts.overwrite {
+		if c.verboseMode {
+			log.Log.Debugf(c.ctx, "overwrite mode enabled; dropping dataset %s", datasetID)
+		}
+		err := c.DropDataset(datasetID, true) // Delete with contents
+		if err != nil {
+			return fmt.Errorf("failed to drop existing dataset: %w", err)
+		}
 	}
 
 	if c.verboseMode {
@@ -604,7 +616,23 @@ func (c *Client) CreateView(viewName, query string, replace bool) error {
 
 	viewRef := c.client.Dataset(c.datasetID).Table(viewName)
 
-	if replace {
+	// Check if view already exists
+	exists, err := c.ViewExists(viewName)
+	if err != nil {
+		return fmt.Errorf("failed to check if view exists: %w", err)
+	}
+
+	if exists && !replace {
+		if c.verboseMode {
+			log.Log.Debugf(c.ctx, "view %s already exists in %s, replace option is false, skipping", viewName, c.datasetID)
+		}
+		return nil
+	}
+
+	if exists && replace {
+		if c.verboseMode {
+			log.Log.Debugf(c.ctx, "replace mode enabled; dropping view %s in %s", viewName, c.datasetID)
+		}
 		err := viewRef.Delete(c.ctx)
 		if err != nil && !strings.Contains(err.Error(), "notFound") {
 			return fmt.Errorf("failed to delete existing view: %w", err)
@@ -617,7 +645,7 @@ func (c *Client) CreateView(viewName, query string, replace bool) error {
 		ViewQuery: query,
 	}
 
-	err := viewRef.Create(c.ctx, viewMetadata)
+	err = viewRef.Create(c.ctx, viewMetadata)
 	if err != nil {
 		return fmt.Errorf("could not create view: %w", err)
 	}
@@ -786,7 +814,11 @@ func (c *Client) IsIndexExistent(table *Table, cols *[]Column) (bool, error) {
 		return false, nil
 	}
 
-	// Check if all requested columns are in the clustering
+	// Check if the clustering fields exactly match the requested columns
+	if len(metadata.Clustering.Fields) != len(*cols) {
+		return false, nil
+	}
+
 	requestedColumns := make(map[string]bool)
 	for _, col := range *cols {
 		requestedColumns[col.Name] = true
