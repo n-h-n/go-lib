@@ -66,12 +66,6 @@ func NewClient(
 		return nil, fmt.Errorf("invalid dataset ID: %w", err)
 	}
 
-	// create dataset if it doesn't exist
-	err = c.CreateDataset(c.datasetID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create dataset: %w", err)
-	}
-
 	var clientOptions []option.ClientOption
 
 	// Handle authentication
@@ -103,6 +97,12 @@ func NewClient(
 	}
 
 	c.client = client
+
+	// create dataset if it doesn't exist (after client is created)
+	err = c.CreateDataset(c.datasetID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dataset: %w", err)
+	}
 
 	if c.verboseMode {
 		log.Log.Debugf(ctx, "successfully connected to BigQuery project: %s, dataset: %s", c.projectID, c.datasetID)
