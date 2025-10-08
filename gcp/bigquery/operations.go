@@ -611,6 +611,81 @@ func (c *Client) QueryWithParams(query string, params map[string]interface{}) (*
 	return nil, nil
 }
 
+// SelectRows selects rows from a table based on WHERE conditions
+func (c *Client) SelectRows(tableName string, opts ...func(*selectRowsOpts)) (*bigquery.RowIterator, error) {
+	if tableName == "" {
+		return nil, fmt.Errorf("table name cannot be empty")
+	}
+
+	selectOpts := selectRowsOpts{
+		columns: []string{"*"}, // Default to select all columns
+		limit:   0,             // No limit by default
+	}
+
+	for _, opt := range opts {
+		opt(&selectOpts)
+	}
+
+	// Check if table exists
+	exists, err := c.IsTableExistent(&Table{Name: tableName})
+	if err != nil {
+		return nil, fmt.Errorf("failed to check if table exists: %w", err)
+	}
+	if !exists {
+		return nil, fmt.Errorf("table %s does not exist", tableName)
+	}
+
+	// Build SELECT query
+	columnsClause := strings.Join(selectOpts.columns, ", ")
+	query := fmt.Sprintf("SELECT %s FROM `%s.%s.%s`", columnsClause, c.projectID, c.datasetID, tableName)
+
+	// Add WHERE clause if conditions are provided
+	if len(selectOpts.whereConditions) > 0 {
+		whereClause := strings.Join(selectOpts.whereConditions, " AND ")
+		query += fmt.Sprintf(" WHERE %s", whereClause)
+	}
+
+	// Add GROUP BY clause if specified
+	if len(selectOpts.groupBy) > 0 {
+		groupClause := strings.Join(selectOpts.groupBy, ", ")
+		query += fmt.Sprintf(" GROUP BY %s", groupClause)
+	}
+
+	// Add HAVING clause if specified
+	if len(selectOpts.havingConditions) > 0 {
+		havingClause := strings.Join(selectOpts.havingConditions, " AND ")
+		query += fmt.Sprintf(" HAVING %s", havingClause)
+	}
+
+	// Add WINDOW clause if specified (for window functions with PARTITION BY)
+	if len(selectOpts.windowDefinitions) > 0 {
+		windowClause := strings.Join(selectOpts.windowDefinitions, ", ")
+		query += fmt.Sprintf(" WINDOW %s", windowClause)
+	}
+
+	// Add ORDER BY clause if specified
+	if len(selectOpts.orderBy) > 0 {
+		orderClause := strings.Join(selectOpts.orderBy, ", ")
+		query += fmt.Sprintf(" ORDER BY %s", orderClause)
+	}
+
+	// Add LIMIT clause if specified
+	if selectOpts.limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", selectOpts.limit)
+	}
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "executing SELECT query: %s", query)
+	}
+
+	// Execute query with parameters if any
+	if len(selectOpts.params) > 0 {
+		return c.QueryWithParams(query, selectOpts.params)
+	}
+
+	return c.Query(query)
+}
+
 // CreateDataset creates a BigQuery dataset
 func (c *Client) CreateDataset(datasetID string, opts ...func(*createDatasetOpts)) error {
 	if datasetID == "" {
@@ -1299,6 +1374,83 @@ func WithVectorIndex(config *VectorIndexConfig) func(*indexOpts) {
 	return func(opts *indexOpts) {
 		opts.typ = IndexTypeVector
 		opts.vectorIndex = config
+	}
+}
+
+type selectRowsOpts struct {
+	columns           []string
+	whereConditions   []string
+	groupBy           []string
+	havingConditions  []string
+	windowDefinitions []string
+	orderBy           []string
+	limit             int
+	params            map[string]interface{}
+}
+
+func WithSelectColumns(columns []string) func(*selectRowsOpts) {
+	return func(opts *selectRowsOpts) {
+		opts.columns = columns
+	}
+}
+
+func WithWhereCondition(condition string) func(*selectRowsOpts) {
+	return func(opts *selectRowsOpts) {
+		opts.whereConditions = append(opts.whereConditions, condition)
+	}
+}
+
+func WithWhereConditions(conditions []string) func(*selectRowsOpts) {
+	return func(opts *selectRowsOpts) {
+		opts.whereConditions = append(opts.whereConditions, conditions...)
+	}
+}
+
+func WithGroupBy(groupBy []string) func(*selectRowsOpts) {
+	return func(opts *selectRowsOpts) {
+		opts.groupBy = groupBy
+	}
+}
+
+func WithHavingCondition(condition string) func(*selectRowsOpts) {
+	return func(opts *selectRowsOpts) {
+		opts.havingConditions = append(opts.havingConditions, condition)
+	}
+}
+
+func WithHavingConditions(conditions []string) func(*selectRowsOpts) {
+	return func(opts *selectRowsOpts) {
+		opts.havingConditions = append(opts.havingConditions, conditions...)
+	}
+}
+
+func WithWindowDefinition(windowName, definition string) func(*selectRowsOpts) {
+	return func(opts *selectRowsOpts) {
+		opts.windowDefinitions = append(opts.windowDefinitions, fmt.Sprintf("%s AS (%s)", windowName, definition))
+	}
+}
+
+func WithWindowDefinitions(definitions []string) func(*selectRowsOpts) {
+	return func(opts *selectRowsOpts) {
+		opts.windowDefinitions = append(opts.windowDefinitions, definitions...)
+	}
+}
+
+func WithOrderBy(orderBy []string) func(*selectRowsOpts) {
+	return func(opts *selectRowsOpts) {
+		opts.orderBy = orderBy
+	}
+}
+
+func WithLimit(limit int) func(*selectRowsOpts) {
+	return func(opts *selectRowsOpts) {
+		opts.limit = limit
+	}
+}
+
+func WithSelectParams(params map[string]interface{}) func(*selectRowsOpts) {
+	return func(opts *selectRowsOpts) {
+		opts.params = params
 	}
 }
 
