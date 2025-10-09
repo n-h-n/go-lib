@@ -84,12 +84,12 @@ func goTypeToBigQueryType(t reflect.Type) (bigqueryType, error) {
 		if t.Elem().Kind() == reflect.Uint8 {
 			return TypeBytes, nil
 		}
-		// For other slice types, return as ARRAY<type>
+		// For other slice types, return the element type (Repeated flag will be set separately)
 		elemType, err := goTypeToBigQueryType(t.Elem())
 		if err != nil {
 			return "", err
 		}
-		return bigqueryType("ARRAY<" + string(elemType) + ">"), nil
+		return elemType, nil
 	case reflect.Map, reflect.Interface:
 		return TypeJSON, nil
 	case reflect.Struct:
@@ -109,16 +109,7 @@ func goTypeToBigQueryType(t reflect.Type) (bigqueryType, error) {
 
 // bigQueryTypeToGoType converts BigQuery types to Go types
 func bigQueryTypeToGoType(t bigqueryType) (reflect.Type, error) {
-	if strings.HasPrefix(string(t), "ARRAY<") && strings.HasSuffix(string(t), ">") {
-		// This is an ARRAY<type> format
-		elementTypeStr := string(t)[6 : len(t)-1] // Remove "ARRAY<" and ">"
-		elementType := bigqueryType(elementTypeStr)
-		elementGoType, err := bigQueryTypeToGoType(elementType)
-		if err != nil {
-			return nil, err
-		}
-		return reflect.SliceOf(elementGoType), nil
-	} else if strings.HasSuffix(string(t), "[]") {
+	if strings.HasSuffix(string(t), "[]") {
 		// This is an old array type format (for backward compatibility)
 		elementType := t[:len(t)-2]
 		elementGoType, err := bigQueryTypeToGoType(elementType)
@@ -238,6 +229,11 @@ func GetColumns(s interface{}) (*map[string]Column, string) {
 				if tagPart == "repeated" {
 					c.Mode = "REPEATED"
 				}
+			}
+		} else {
+			// Only set REPEATED automatically if no explicit mode was specified in tags
+			if field.Type.Kind() == reflect.Slice && field.Type.Elem().Kind() != reflect.Uint8 {
+				c.Mode = "REPEATED"
 			}
 		}
 
