@@ -1,6 +1,7 @@
 package bigquery
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -33,14 +34,28 @@ func (r *rowValueSaver) Save() (map[string]bigquery.Value, string, error) {
 			}
 		}
 
-		// Handle empty slices for JSON fields - convert to null instead of empty array
+		// Handle slices for JSON fields - serialize as JSON or convert empty slices to null
 		if col.Type == TypeJSON && value != nil {
 			if reflect.TypeOf(value).Kind() == reflect.Slice {
 				sliceValue := reflect.ValueOf(value)
 				if sliceValue.Len() == 0 {
 					// Empty slice for JSON field should be null, not empty array
 					value = nil
+				} else {
+					// Non-empty slice needs to be serialized as JSON
+					jsonBytes, err := json.Marshal(value)
+					if err != nil {
+						return nil, "", fmt.Errorf("failed to marshal JSON field %s: %w", colName, err)
+					}
+					value = string(jsonBytes)
 				}
+			} else if reflect.TypeOf(value).Kind() == reflect.Ptr {
+				// Handle pointers to structs - serialize as JSON
+				jsonBytes, err := json.Marshal(value)
+				if err != nil {
+					return nil, "", fmt.Errorf("failed to marshal JSON field %s: %w", colName, err)
+				}
+				value = string(jsonBytes)
 			}
 		}
 
