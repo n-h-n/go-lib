@@ -254,13 +254,13 @@ func GetColumns(s interface{}) (*map[string]Column, string) {
 					c.Mode = "REPEATED"
 				}
 			}
-		} else {
-			// Only set REPEATED automatically if no explicit mode was specified in tags
-			if field.Type.Kind() == reflect.Slice && field.Type.Elem().Kind() != reflect.Uint8 {
-				// Don't set REPEATED for slices of pointers to structs (they become JSON)
-				if !(field.Type.Elem().Kind() == reflect.Ptr && field.Type.Elem().Elem().Kind() == reflect.Struct) {
-					c.Mode = "REPEATED"
-				}
+		}
+
+		// Override mode for slice types - slices should always be REPEATED unless explicitly set to JSON
+		if field.Type.Kind() == reflect.Slice && field.Type.Elem().Kind() != reflect.Uint8 {
+			// Don't set REPEATED for slices of pointers to structs (they become JSON)
+			if !(field.Type.Elem().Kind() == reflect.Ptr && field.Type.Elem().Elem().Kind() == reflect.Struct) {
+				c.Mode = "REPEATED"
 			}
 		}
 
