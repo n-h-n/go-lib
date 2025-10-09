@@ -32,6 +32,18 @@ func (r *rowValueSaver) Save() (map[string]bigquery.Value, string, error) {
 				}
 			}
 		}
+
+		// Handle empty slices for JSON fields - convert to null instead of empty array
+		if col.Type == TypeJSON && value != nil {
+			if reflect.TypeOf(value).Kind() == reflect.Slice {
+				sliceValue := reflect.ValueOf(value)
+				if sliceValue.Len() == 0 {
+					// Empty slice for JSON field should be null, not empty array
+					value = nil
+				}
+			}
+		}
+
 		values[colName] = value
 	}
 
