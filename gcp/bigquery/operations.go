@@ -11,6 +11,33 @@ import (
 	"github.com/n-h-n/go-lib/utils"
 )
 
+// rowValueSaver implements bigquery.ValueSaver for Row interface
+type rowValueSaver struct {
+	row Row
+}
+
+// Save implements bigquery.ValueSaver interface
+func (r *rowValueSaver) Save() (map[string]bigquery.Value, string, error) {
+	cols := r.row.Columns()
+	values := make(map[string]bigquery.Value)
+
+	for colName, col := range *cols {
+		// Use default value if column value is nil
+		value := col.Value
+		if value == nil {
+			// Convert BigQuery type to Go type first
+			if goType, err := bigQueryTypeToGoType(col.Type); err == nil {
+				if defaultValue, err := bigQueryDefaultValue(goType); err == nil {
+					value = defaultValue
+				}
+			}
+		}
+		values[colName] = value
+	}
+
+	return values, "", nil
+}
+
 // CreateTable creates a BigQuery table
 func (c *Client) CreateTable(table *Table, opts ...func(*createTableOpts)) error {
 	if table == nil {
@@ -489,46 +516,23 @@ func (c *Client) UpsertRows(rows ...Row) error {
 			return fmt.Errorf("failed to upsert: schema is not aligned")
 		}
 
-		// Prepare data for insertion
-		cols := row.Columns()
-		colNames := utils.GetKeysFromMap(*cols)
-		values := make([]bigquery.Value, len(colNames))
-
-		for i, colName := range colNames {
-			col := (*cols)[colName]
-			values[i] = col.Value
-		}
-
-		// Insert data
+		// Insert data using ValueSaver wrapper
 		tableRef := c.GetTableReference(table.Name)
 		inserter := tableRef.Inserter()
 
-		// Create a map for the row data
-		rowData := make(map[string]bigquery.Value)
-		for colName, col := range *cols {
-			// Use default value if column value is nil
-			value := col.Value
-			if value == nil {
-				// Convert BigQuery type to Go type first
-				if goType, err := bigQueryTypeToGoType(col.Type); err == nil {
-					if defaultValue, err := bigQueryDefaultValue(goType); err == nil {
-						value = defaultValue
-					}
-				}
-			}
-			rowData[colName] = value
-		}
-
 		if c.verboseMode {
 			// Debug: show formatted values being inserted
+			cols := row.Columns()
 			var formattedValues []string
-			for colName, value := range rowData {
-				formattedValues = append(formattedValues, fmt.Sprintf("%s=%s", colName, formatBigQueryValue(value)))
+			for colName, col := range *cols {
+				formattedValues = append(formattedValues, fmt.Sprintf("%s=%s", colName, formatBigQueryValue(col.Value)))
 			}
 			log.Log.Debugf(c.ctx, "upserting row in table %s: %s", table.Name, strings.Join(formattedValues, ", "))
 		}
 
-		err = inserter.Put(c.ctx, rowData)
+		// Create a ValueSaver wrapper for the row
+		rowSaver := &rowValueSaver{row: row}
+		err = inserter.Put(c.ctx, rowSaver)
 		if err != nil {
 			return fmt.Errorf("failed to upsert row in table %s: %w", table.Name, err)
 		}
