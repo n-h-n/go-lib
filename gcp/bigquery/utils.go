@@ -256,12 +256,25 @@ func GetColumns(s interface{}) (*map[string]Column, string) {
 			}
 		}
 
-		// Override mode for slice types - slices should always be REPEATED unless explicitly set to JSON
+		// Override mode for slice types - slices should always be REPEATED unless they contain complex types
 		if field.Type.Kind() == reflect.Slice && field.Type.Elem().Kind() != reflect.Uint8 {
-			// Don't set REPEATED for slices of pointers to structs (they become JSON)
-			if !(field.Type.Elem().Kind() == reflect.Ptr && field.Type.Elem().Elem().Kind() == reflect.Struct) {
+			elemType := field.Type.Elem()
+
+			// Check if element type is a basic type (not complex)
+			isBasicType := elemType.Kind() == reflect.String ||
+				elemType.Kind() == reflect.Int || elemType.Kind() == reflect.Int64 ||
+				elemType.Kind() == reflect.Float32 || elemType.Kind() == reflect.Float64 ||
+				elemType.Kind() == reflect.Bool ||
+				(elemType.Kind() == reflect.Ptr &&
+					(elemType.Elem().Kind() == reflect.String ||
+						elemType.Elem().Kind() == reflect.Int || elemType.Elem().Kind() == reflect.Int64 ||
+						elemType.Elem().Kind() == reflect.Float32 || elemType.Elem().Kind() == reflect.Float64 ||
+						elemType.Elem().Kind() == reflect.Bool)) // *string, *int, *int64, *float32, *float64, *bool
+
+			if isBasicType {
 				c.Mode = "REPEATED"
 			}
+			// Otherwise, leave it as JSON (for complex types like []*struct{}, [][]string, etc.)
 		}
 
 		columns[tagParts[0]] = c
