@@ -84,12 +84,12 @@ func goTypeToBigQueryType(t reflect.Type) (bigqueryType, error) {
 		if t.Elem().Kind() == reflect.Uint8 {
 			return TypeBytes, nil
 		}
-		// For other slice types, return as ARRAY
+		// For other slice types, return as ARRAY<type>
 		elemType, err := goTypeToBigQueryType(t.Elem())
 		if err != nil {
 			return "", err
 		}
-		return elemType + "[]", nil
+		return bigqueryType("ARRAY<" + string(elemType) + ">"), nil
 	case reflect.Map, reflect.Interface:
 		return TypeJSON, nil
 	case reflect.Struct:
@@ -109,8 +109,17 @@ func goTypeToBigQueryType(t reflect.Type) (bigqueryType, error) {
 
 // bigQueryTypeToGoType converts BigQuery types to Go types
 func bigQueryTypeToGoType(t bigqueryType) (reflect.Type, error) {
-	if strings.HasSuffix(string(t), "[]") {
-		// This is an array type
+	if strings.HasPrefix(string(t), "ARRAY<") && strings.HasSuffix(string(t), ">") {
+		// This is an ARRAY<type> format
+		elementTypeStr := string(t)[6 : len(t)-1] // Remove "ARRAY<" and ">"
+		elementType := bigqueryType(elementTypeStr)
+		elementGoType, err := bigQueryTypeToGoType(elementType)
+		if err != nil {
+			return nil, err
+		}
+		return reflect.SliceOf(elementGoType), nil
+	} else if strings.HasSuffix(string(t), "[]") {
+		// This is an old array type format (for backward compatibility)
 		elementType := t[:len(t)-2]
 		elementGoType, err := bigQueryTypeToGoType(elementType)
 		if err != nil {
