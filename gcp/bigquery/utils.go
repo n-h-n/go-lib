@@ -3,12 +3,69 @@ package bigquery
 import (
 	"crypto/sha256"
 	"encoding/base32"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"slices"
 	"strings"
 	"time"
 )
+
+// hasJSONTags checks if a struct has any fields with JSON tags
+func hasJSONTags(t reflect.Type) bool {
+	if t.Kind() != reflect.Struct {
+		return false
+	}
+
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if _, ok := field.Tag.Lookup("json"); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// deserializeJSONToStruct attempts to deserialize JSON data into a struct with JSON tags
+func deserializeJSONToStruct(data interface{}, targetType reflect.Type) (interface{}, error) {
+	if targetType.Kind() != reflect.Struct {
+		return data, nil
+	}
+
+	// Convert data to JSON bytes
+	var jsonBytes []byte
+	var err error
+
+	switch v := data.(type) {
+	case string:
+		jsonBytes = []byte(v)
+	case []byte:
+		jsonBytes = v
+	default:
+		jsonBytes, err = json.Marshal(data)
+		if err != nil {
+			return data, fmt.Errorf("failed to marshal data to JSON: %w", err)
+		}
+	}
+
+	// Create a new instance of the target type
+	targetValue := reflect.New(targetType).Interface()
+
+	// Unmarshal JSON into the struct
+	err = json.Unmarshal(jsonBytes, targetValue)
+	if err != nil {
+		return data, fmt.Errorf("failed to unmarshal JSON to struct: %w", err)
+	}
+
+	// Return the value (not the pointer)
+	return reflect.ValueOf(targetValue).Elem().Interface(), nil
+}
+
+// DeserializeJSONField attempts to deserialize a JSON field from BigQuery into a Go struct
+// This is useful when reading JSON columns back into structs with JSON tags
+func DeserializeJSONField(data interface{}, targetType reflect.Type) (interface{}, error) {
+	return deserializeJSONToStruct(data, targetType)
+}
 
 // goTypeToBigQueryType converts Go types to BigQuery types
 func goTypeToBigQueryType(t reflect.Type) (bigqueryType, error) {
@@ -38,6 +95,10 @@ func goTypeToBigQueryType(t reflect.Type) (bigqueryType, error) {
 	case reflect.Struct:
 		if t == reflect.TypeOf(time.Time{}) {
 			return TypeTimestamp, nil
+		}
+		// Check if struct has JSON tags - if so, treat as JSON
+		if hasJSONTags(t) {
+			return TypeJSON, nil
 		}
 		// For other structs, treat as RECORD
 		return TypeRecord, nil

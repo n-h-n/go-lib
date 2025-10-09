@@ -2,6 +2,7 @@ package bigquery
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -686,6 +687,96 @@ func (c *Client) SelectRows(tableName string, opts ...func(*selectRowsOpts)) (*b
 	return c.Query(query)
 }
 
+// LeftJoin performs a LEFT JOIN between two tables
+func (c *Client) LeftJoin(leftTable *Table, rightTable *Table, joinColumns []JoinColumnPair) (*bigquery.RowIterator, *JoinResultantColumns, error) {
+	if leftTable == nil || rightTable == nil {
+		return nil, nil, fmt.Errorf("unable to left join: tables cannot be nil")
+	}
+
+	for _, pair := range joinColumns {
+		if pair.LeftColumnName == "" || pair.RightColumnName == "" {
+			return nil, nil, fmt.Errorf("unable to left join: join column pair names cannot be empty")
+		}
+	}
+
+	// Check if tables exist and schema align
+	for _, t := range []*Table{leftTable, rightTable} {
+		exists, err := c.IsTableExistent(t)
+		if err != nil {
+			return nil, nil, fmt.Errorf("could not check if table %s exists: %w", t.Name, err)
+		}
+		if !exists {
+			return nil, nil, fmt.Errorf("table %s does not exist", t.Name)
+		}
+
+		aligned, err := c.IsSchemaAligned(t)
+		if err != nil {
+			return nil, nil, fmt.Errorf("could not check if schema is aligned: %w", err)
+		}
+		if !aligned {
+			return nil, nil, fmt.Errorf("schema is not aligned for table %s", t.Name)
+		}
+	}
+
+	// Get columns for tables
+	columns := &JoinResultantColumns{
+		Columns: make(map[string]reflect.Type),
+	}
+	for i, t := range []*Table{leftTable, rightTable} {
+		schema, err := c.GetTableSchema(t.Name)
+		if err != nil {
+			return nil, nil, fmt.Errorf("could not get schema for table %s: %w", t.Name, err)
+		}
+
+		for _, field := range schema.Fields {
+			columnName := field.Name
+
+			// Check if column name already exists (for right table)
+			if i == 1 {
+				if _, ok := columns.Columns[columnName]; ok {
+					columnName = fmt.Sprintf("%s_%s", t.Name, field.Name)
+				}
+			}
+
+			goType, err := bigQueryTypeToGoType(field.Type)
+			if err != nil {
+				return nil, nil, fmt.Errorf("could not convert BigQuery type %s to Go type: %w", field.Type, err)
+			}
+
+			columns.Columns[columnName] = goType
+		}
+	}
+
+	// Create join query
+	query := fmt.Sprintf(
+		"SELECT * FROM `%s.%s.%s` LEFT JOIN `%s.%s.%s` ON ",
+		c.projectID, c.datasetID, leftTable.Name,
+		c.projectID, c.datasetID, rightTable.Name,
+	)
+
+	for i, pair := range joinColumns {
+		if i > 0 {
+			query += " AND "
+		}
+
+		query += fmt.Sprintf("`%s.%s.%s`.%s = `%s.%s.%s`.%s",
+			c.projectID, c.datasetID, leftTable.Name, escapeIdentifier(pair.LeftColumnName),
+			c.projectID, c.datasetID, rightTable.Name, escapeIdentifier(pair.RightColumnName))
+	}
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "executing LEFT JOIN query: %s", query)
+	}
+
+	// Execute the join query
+	it, err := c.Query(query)
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not execute join query: %w", err)
+	}
+
+	return it, columns, nil
+}
+
 // CreateDataset creates a BigQuery dataset
 func (c *Client) CreateDataset(datasetID string, opts ...func(*createDatasetOpts)) error {
 	if datasetID == "" {
@@ -1000,7 +1091,7 @@ func (c *Client) createSearchIndex(table *Table, config *SearchIndexConfig) erro
 	query := fmt.Sprintf(`
 		CREATE SEARCH INDEX %s
 		ON %s.%s.%s %s
-	`, config.Name, c.projectID, c.datasetID, table.Name, columnsClause)
+	`, escapeIdentifier(config.Name), c.projectID, c.datasetID, table.Name, columnsClause)
 
 	if c.verboseMode {
 		log.Log.Debugf(c.ctx, "executing search index DDL: %s", query)
@@ -1019,7 +1110,7 @@ func (c *Client) createVectorIndex(table *Table, config *VectorIndexConfig) erro
 	query := fmt.Sprintf(`
 		CREATE VECTOR INDEX %s
 		ON %s.%s.%s (%s)
-	`, config.Name, c.projectID, c.datasetID, table.Name, config.Column)
+	`, escapeIdentifier(config.Name), c.projectID, c.datasetID, table.Name, escapeIdentifier(config.Column))
 
 	// Add options if specified
 	if len(config.Options) > 0 || config.DistanceType != "" || config.Dimensions > 0 {
@@ -1087,7 +1178,7 @@ func (c *Client) DropIndex(table *Table, opts *indexOpts) error {
 			return fmt.Errorf("search index name is required for dropping")
 		}
 		query := fmt.Sprintf("DROP SEARCH INDEX %s ON %s.%s.%s",
-			opts.searchIndex.Name, c.projectID, c.datasetID, table.Name)
+			escapeIdentifier(opts.searchIndex.Name), c.projectID, c.datasetID, table.Name)
 
 		if c.verboseMode {
 			log.Log.Debugf(c.ctx, "executing drop search index DDL: %s", query)
@@ -1103,7 +1194,7 @@ func (c *Client) DropIndex(table *Table, opts *indexOpts) error {
 			return fmt.Errorf("vector index name is required for dropping")
 		}
 		query := fmt.Sprintf("DROP VECTOR INDEX %s ON %s.%s.%s",
-			opts.vectorIndex.Name, c.projectID, c.datasetID, table.Name)
+			escapeIdentifier(opts.vectorIndex.Name), c.projectID, c.datasetID, table.Name)
 
 		if c.verboseMode {
 			log.Log.Debugf(c.ctx, "executing drop vector index DDL: %s", query)
@@ -1200,8 +1291,8 @@ func (c *Client) IsIndexExistent(table *Table, opts *indexOpts) (bool, error) {
 		query := fmt.Sprintf(`
 			SELECT COUNT(*) as count
 			FROM %s.%s.INFORMATION_SCHEMA.SEARCH_INDEXES
-			WHERE table_name = '%s' AND index_name = '%s'
-		`, c.projectID, c.datasetID, table.Name, opts.searchIndex.Name)
+			WHERE table_name = %s AND index_name = %s
+		`, c.projectID, c.datasetID, escapeIdentifier(table.Name), escapeIdentifier(opts.searchIndex.Name))
 
 		it, err := c.ExecuteQuery(c.ctx, query)
 		if err != nil {
@@ -1227,8 +1318,8 @@ func (c *Client) IsIndexExistent(table *Table, opts *indexOpts) (bool, error) {
 		query := fmt.Sprintf(`
 			SELECT COUNT(*) as count
 			FROM %s.%s.INFORMATION_SCHEMA.VECTOR_INDEXES
-			WHERE table_name = '%s' AND index_name = '%s'
-		`, c.projectID, c.datasetID, table.Name, opts.vectorIndex.Name)
+			WHERE table_name = %s AND index_name = %s
+		`, c.projectID, c.datasetID, escapeIdentifier(table.Name), escapeIdentifier(opts.vectorIndex.Name))
 
 		it, err := c.ExecuteQuery(c.ctx, query)
 		if err != nil {
