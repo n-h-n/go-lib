@@ -96,6 +96,13 @@ func goTypeToBigQueryType(t reflect.Type) (bigqueryType, error) {
 		return elemType, nil
 	case reflect.Map, reflect.Interface:
 		return TypeJSON, nil
+	case reflect.Ptr:
+		// Handle pointers to structs as JSON
+		if t.Elem().Kind() == reflect.Struct {
+			return TypeJSON, nil
+		}
+		// For other pointer types, dereference and recurse
+		return goTypeToBigQueryType(t.Elem())
 	case reflect.Struct:
 		if t == reflect.TypeOf(time.Time{}) {
 			return TypeTimestamp, nil
