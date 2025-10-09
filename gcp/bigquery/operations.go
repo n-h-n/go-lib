@@ -528,7 +528,7 @@ func (c *Client) UpsertRows(rows ...Row) error {
 			log.Log.Debugf(c.ctx, "upserting row in table %s: %s", table.Name, strings.Join(formattedValues, ", "))
 		}
 
-		err = inserter.Put(c.ctx, []map[string]bigquery.Value{rowData})
+		err = inserter.Put(c.ctx, rowData)
 		if err != nil {
 			return fmt.Errorf("failed to upsert row in table %s: %w", table.Name, err)
 		}
