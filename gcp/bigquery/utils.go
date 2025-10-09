@@ -84,6 +84,10 @@ func goTypeToBigQueryType(t reflect.Type) (bigqueryType, error) {
 		if t.Elem().Kind() == reflect.Uint8 {
 			return TypeBytes, nil
 		}
+		// Check if this is a slice of pointers to structs (e.g., []*MyStruct)
+		if t.Elem().Kind() == reflect.Ptr && t.Elem().Elem().Kind() == reflect.Struct {
+			return TypeJSON, nil
+		}
 		// For other slice types, return the element type (Repeated flag will be set separately)
 		elemType, err := goTypeToBigQueryType(t.Elem())
 		if err != nil {
@@ -233,7 +237,10 @@ func GetColumns(s interface{}) (*map[string]Column, string) {
 		} else {
 			// Only set REPEATED automatically if no explicit mode was specified in tags
 			if field.Type.Kind() == reflect.Slice && field.Type.Elem().Kind() != reflect.Uint8 {
-				c.Mode = "REPEATED"
+				// Don't set REPEATED for slices of pointers to structs (they become JSON)
+				if !(field.Type.Elem().Kind() == reflect.Ptr && field.Type.Elem().Elem().Kind() == reflect.Struct) {
+					c.Mode = "REPEATED"
+				}
 			}
 		}
 
