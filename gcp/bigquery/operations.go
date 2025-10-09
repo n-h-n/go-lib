@@ -17,6 +17,11 @@ func (c *Client) CreateTable(table *Table, opts ...func(*createTableOpts)) error
 		return fmt.Errorf("unable to create table: table cannot be nil")
 	}
 
+	// Validate table name
+	if err := validateTableName(table.Name); err != nil {
+		return fmt.Errorf("invalid table name: %w", err)
+	}
+
 	createOpts := createTableOpts{
 		overwrite: false,
 	}
@@ -102,6 +107,11 @@ func (c *Client) DropTable(tableName string) error {
 		return fmt.Errorf("table name cannot be empty")
 	}
 
+	// Validate table name
+	if err := validateTableName(tableName); err != nil {
+		return fmt.Errorf("invalid table name: %w", err)
+	}
+
 	tableRef := c.GetTableReference(tableName)
 	err := tableRef.Delete(c.ctx)
 	if err != nil {
@@ -155,6 +165,11 @@ func (c *Client) GetTableNames() ([]string, error) {
 
 // GetTableSchema returns the schema of a table
 func (c *Client) GetTableSchema(tableName string) (*Schema, error) {
+	// Validate table name
+	if err := validateTableName(tableName); err != nil {
+		return nil, fmt.Errorf("invalid table name: %w", err)
+	}
+
 	tableRef := c.GetTableReference(tableName)
 	metadata, err := tableRef.Metadata(c.ctx)
 	if err != nil {
@@ -491,7 +506,26 @@ func (c *Client) UpsertRows(rows ...Row) error {
 		// Create a map for the row data
 		rowData := make(map[string]bigquery.Value)
 		for colName, col := range *cols {
-			rowData[colName] = col.Value
+			// Use default value if column value is nil
+			value := col.Value
+			if value == nil {
+				// Convert BigQuery type to Go type first
+				if goType, err := bigQueryTypeToGoType(col.Type); err == nil {
+					if defaultValue, err := bigQueryDefaultValue(goType); err == nil {
+						value = defaultValue
+					}
+				}
+			}
+			rowData[colName] = value
+		}
+
+		if c.verboseMode {
+			// Debug: show formatted values being inserted
+			var formattedValues []string
+			for colName, value := range rowData {
+				formattedValues = append(formattedValues, fmt.Sprintf("%s=%s", colName, formatBigQueryValue(value)))
+			}
+			log.Log.Debugf(c.ctx, "upserting row in table %s: %s", table.Name, strings.Join(formattedValues, ", "))
 		}
 
 		err = inserter.Put(c.ctx, []map[string]bigquery.Value{rowData})
@@ -557,6 +591,15 @@ func (c *Client) DeleteRows(rows ...Row) error {
 
 		query := fmt.Sprintf("DELETE FROM `%s.%s.%s` WHERE %s", c.projectID, c.datasetID, table.Name, whereClause)
 
+		if c.verboseMode {
+			// Debug: show formatted parameter values
+			var formattedParams []string
+			for paramName, paramValue := range params {
+				formattedParams = append(formattedParams, fmt.Sprintf("@%s=%s", paramName, formatBigQueryValue(paramValue)))
+			}
+			log.Log.Debugf(c.ctx, "deleting row from table %s with params: %s", table.Name, strings.Join(formattedParams, ", "))
+		}
+
 		// Execute DELETE query with parameters
 		_, err = c.QueryWithParams(query, params)
 		if err != nil {
@@ -576,6 +619,12 @@ func (c *Client) Query(query string) (*bigquery.RowIterator, error) {
 func (c *Client) QueryWithParams(query string, params map[string]interface{}) (*bigquery.RowIterator, error) {
 	if c.verboseMode {
 		log.Log.Debugf(c.ctx, "executing parameterized query: %s", query)
+		// Debug: show formatted parameter values
+		var formattedParams []string
+		for paramName, paramValue := range params {
+			formattedParams = append(formattedParams, fmt.Sprintf("@%s=%s", paramName, formatBigQueryValue(paramValue)))
+		}
+		log.Log.Debugf(c.ctx, "query parameters: %s", strings.Join(formattedParams, ", "))
 	}
 
 	q := c.client.Query(query)
@@ -618,6 +667,11 @@ func (c *Client) SelectRows(tableName string, opts ...func(*selectRowsOpts)) (*b
 		return nil, fmt.Errorf("table name cannot be empty")
 	}
 
+	// Validate table name
+	if err := validateTableName(tableName); err != nil {
+		return nil, fmt.Errorf("invalid table name: %w", err)
+	}
+
 	selectOpts := selectRowsOpts{
 		columns: []string{"*"}, // Default to select all columns
 		limit:   0,             // No limit by default
@@ -641,7 +695,12 @@ func (c *Client) SelectRows(tableName string, opts ...func(*selectRowsOpts)) (*b
 	query := fmt.Sprintf("SELECT %s FROM `%s.%s.%s`", columnsClause, c.projectID, c.datasetID, tableName)
 
 	// Add WHERE clause if conditions are provided
-	if len(selectOpts.whereConditions) > 0 {
+	if len(selectOpts.whereConditionsMap) > 0 {
+		// Use buildWhereClause for map-based conditions
+		whereClause := buildWhereClause(selectOpts.whereConditionsMap)
+		query += " " + whereClause
+	} else if len(selectOpts.whereConditions) > 0 {
+		// Use string-based conditions
 		whereClause := strings.Join(selectOpts.whereConditions, " AND ")
 		query += fmt.Sprintf(" WHERE %s", whereClause)
 	}
@@ -666,13 +725,12 @@ func (c *Client) SelectRows(tableName string, opts ...func(*selectRowsOpts)) (*b
 
 	// Add ORDER BY clause if specified
 	if len(selectOpts.orderBy) > 0 {
-		orderClause := strings.Join(selectOpts.orderBy, ", ")
-		query += fmt.Sprintf(" ORDER BY %s", orderClause)
+		query += " " + buildOrderByClause(selectOpts.orderBy)
 	}
 
 	// Add LIMIT clause if specified
 	if selectOpts.limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", selectOpts.limit)
+		query += " " + buildLimitClause(selectOpts.limit)
 	}
 
 	if c.verboseMode {
@@ -976,6 +1034,11 @@ func (c *Client) CreateIndex(table *Table, opts ...func(*indexOpts)) error {
 		return fmt.Errorf("unable to create index: table and table.Name cannot be zero values")
 	}
 
+	// Validate table name
+	if err := validateTableName(table.Name); err != nil {
+		return fmt.Errorf("invalid table name: %w", err)
+	}
+
 	// Validate that we have something to create
 	if o.typ == IndexTypeClustering && len(o.clusteringFields) == 0 {
 		return fmt.Errorf("unable to create clustering index: no clustering fields provided")
@@ -1079,6 +1142,29 @@ func (c *Client) CreateIndex(table *Table, opts ...func(*indexOpts)) error {
 
 // createSearchIndex creates a search index using DDL
 func (c *Client) createSearchIndex(table *Table, config *SearchIndexConfig) error {
+	// Generate index name if not provided
+	indexName := config.Name
+	if indexName == "" {
+		// Create columns for name generation
+		var cols []Column
+		if config.IndexAllColumns {
+			// For ALL COLUMNS, we can't generate a specific name, so use a generic one
+			indexName = fmt.Sprintf("%s_search_index", table.Name)
+		} else if len(config.Columns) > 0 {
+			// Create column objects for name generation
+			for _, colName := range config.Columns {
+				cols = append(cols, Column{Name: colName})
+			}
+			if generatedName, err := createIndexName(table, &cols); err == nil {
+				indexName = generatedName
+			} else {
+				indexName = fmt.Sprintf("%s_search_index", table.Name)
+			}
+		} else {
+			return fmt.Errorf("search index must specify either columns or IndexAllColumns=true")
+		}
+	}
+
 	var columnsClause string
 	if config.IndexAllColumns {
 		columnsClause = "ALL COLUMNS"
@@ -1091,7 +1177,7 @@ func (c *Client) createSearchIndex(table *Table, config *SearchIndexConfig) erro
 	query := fmt.Sprintf(`
 		CREATE SEARCH INDEX %s
 		ON %s.%s.%s %s
-	`, escapeIdentifier(config.Name), c.projectID, c.datasetID, table.Name, columnsClause)
+	`, escapeIdentifier(indexName), c.projectID, c.datasetID, table.Name, columnsClause)
 
 	if c.verboseMode {
 		log.Log.Debugf(c.ctx, "executing search index DDL: %s", query)
@@ -1107,10 +1193,22 @@ func (c *Client) createSearchIndex(table *Table, config *SearchIndexConfig) erro
 
 // createVectorIndex creates a vector index using DDL
 func (c *Client) createVectorIndex(table *Table, config *VectorIndexConfig) error {
+	// Generate index name if not provided
+	indexName := config.Name
+	if indexName == "" {
+		// Create column for name generation
+		cols := []Column{{Name: config.Column}}
+		if generatedName, err := createIndexName(table, &cols); err == nil {
+			indexName = generatedName
+		} else {
+			indexName = fmt.Sprintf("%s_vector_index", table.Name)
+		}
+	}
+
 	query := fmt.Sprintf(`
 		CREATE VECTOR INDEX %s
 		ON %s.%s.%s (%s)
-	`, escapeIdentifier(config.Name), c.projectID, c.datasetID, table.Name, escapeIdentifier(config.Column))
+	`, escapeIdentifier(indexName), c.projectID, c.datasetID, table.Name, escapeIdentifier(config.Column))
 
 	// Add options if specified
 	if len(config.Options) > 0 || config.DistanceType != "" || config.Dimensions > 0 {
@@ -1469,14 +1567,15 @@ func WithVectorIndex(config *VectorIndexConfig) func(*indexOpts) {
 }
 
 type selectRowsOpts struct {
-	columns           []string
-	whereConditions   []string
-	groupBy           []string
-	havingConditions  []string
-	windowDefinitions []string
-	orderBy           []string
-	limit             int
-	params            map[string]interface{}
+	columns            []string
+	whereConditions    []string
+	whereConditionsMap map[string]interface{} // For buildWhereClause
+	groupBy            []string
+	havingConditions   []string
+	windowDefinitions  []string
+	orderBy            []string
+	limit              int
+	params             map[string]interface{}
 }
 
 func WithSelectColumns(columns []string) func(*selectRowsOpts) {
@@ -1494,6 +1593,12 @@ func WithWhereCondition(condition string) func(*selectRowsOpts) {
 func WithWhereConditions(conditions []string) func(*selectRowsOpts) {
 	return func(opts *selectRowsOpts) {
 		opts.whereConditions = append(opts.whereConditions, conditions...)
+	}
+}
+
+func WithWhereConditionsMap(conditions map[string]interface{}) func(*selectRowsOpts) {
+	return func(opts *selectRowsOpts) {
+		opts.whereConditionsMap = conditions
 	}
 }
 
