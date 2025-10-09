@@ -11,6 +11,19 @@ import (
 	"time"
 )
 
+// normalizeBigQueryType normalizes BigQuery type names for comparison
+// BigQuery uses different type names in different contexts (schema vs API)
+func normalizeBigQueryType(t bigqueryType) bigqueryType {
+	switch t {
+	case TypeInteger:
+		return TypeInt64 // INTEGER -> INT64
+	case TypeFloat:
+		return TypeFloat64 // FLOAT -> FLOAT64
+	default:
+		return t // No normalization needed
+	}
+}
+
 // hasJSONTags checks if a struct has any fields with JSON tags
 func hasJSONTags(t reflect.Type) bool {
 	if t.Kind() != reflect.Struct {

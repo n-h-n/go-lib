@@ -303,8 +303,8 @@ func (c *Client) IsSchemaAligned(table *Table, opts ...func(*alignTableOpts)) (b
 			continue
 		}
 
-		// Check type alignment
-		if expectedCol.Type != currentCol.Type {
+		// Check type alignment (normalize types for comparison)
+		if normalizeBigQueryType(expectedCol.Type) != normalizeBigQueryType(currentCol.Type) {
 			if c.verboseMode {
 				log.Log.Debugf(c.ctx, "schema alignment check error: column %s type mismatch; have %s in db, %s in runtime", colName, currentCol.Type, expectedCol.Type)
 			}
