@@ -512,7 +512,7 @@ func (c *Client) AlterTableAddColumns(table *Table) error {
 	return nil
 }
 
-// UpsertRows upserts rows into a BigQuery table
+// UpsertRows upserts rows into a BigQuery table using a MERGE statement
 func (c *Client) UpsertRows(rows ...Row) error {
 	if len(rows) == 0 {
 		return fmt.Errorf("no rows to upsert")
@@ -543,29 +543,137 @@ func (c *Client) UpsertRows(rows ...Row) error {
 			return fmt.Errorf("failed to upsert: schema is not aligned")
 		}
 
-		// Insert data using ValueSaver wrapper
-		tableRef := c.GetTableReference(table.Name)
-		inserter := tableRef.Inserter()
-
-		if c.verboseMode {
-			// Debug: show formatted values being inserted
-			cols := row.Columns()
-			var formattedValues []string
-			for colName, col := range *cols {
-				formattedValues = append(formattedValues, fmt.Sprintf("%s=%s", colName, formatBigQueryValue(col.Value)))
-			}
-			log.Log.Debugf(c.ctx, "upserting row in table %s: %s", table.Name, strings.Join(formattedValues, ", "))
+		// Build MERGE statement for upsert
+		mergeQuery, err := c.buildMergeQuery(row)
+		if err != nil {
+			return fmt.Errorf("failed to build merge query: %w", err)
 		}
 
-		// Create a ValueSaver wrapper for the row
-		rowSaver := &rowValueSaver{row: row}
-		err = inserter.Put(c.ctx, rowSaver)
+		if c.verboseMode {
+			log.Log.Debugf(c.ctx, "executing MERGE query for upsert in table %s: %s", table.Name, mergeQuery)
+		}
+
+		// Execute MERGE statement
+		err = c.ExecuteDML(c.ctx, mergeQuery)
 		if err != nil {
 			return fmt.Errorf("failed to upsert row in table %s: %w", table.Name, err)
 		}
 	}
 
 	return nil
+}
+
+// buildMergeQuery builds a MERGE statement for upserting a row
+func (c *Client) buildMergeQuery(row Row) (string, error) {
+	table := row.Table()
+	cols := row.Columns()
+
+	// Find primary key column
+	var primaryKey string
+
+	for colName, col := range *cols {
+		if col.Mode == "REQUIRED" { // Primary key equivalent
+			primaryKey = colName
+			break
+		}
+	}
+
+	if primaryKey == "" {
+		return "", fmt.Errorf("no primary key found for upsert operation")
+	}
+
+	// Build column lists
+	var insertColumns []string
+	var insertValues []string
+	var updateSet []string
+
+	for colName, col := range *cols {
+		// Format value for SQL
+		formattedValue := c.formatValueForSQL(col.Value, col.Type)
+
+		insertColumns = append(insertColumns, escapeIdentifier(colName))
+		insertValues = append(insertValues, formattedValue)
+
+		// For UPDATE SET, exclude the primary key
+		if colName != primaryKey {
+			updateSet = append(updateSet, fmt.Sprintf("%s = %s", escapeIdentifier(colName), formattedValue))
+		}
+	}
+
+	// Build the MERGE statement
+	mergeQuery := fmt.Sprintf(`
+		MERGE %s.%s.%s AS target
+		USING (
+			SELECT %s
+		) AS source
+		ON target.%s = source.%s
+		WHEN MATCHED THEN
+			UPDATE SET %s
+		WHEN NOT MATCHED THEN
+			INSERT (%s)
+			VALUES (%s)`,
+		c.projectID, c.datasetID, table.Name,
+		strings.Join(insertValues, ", "),
+		escapeIdentifier(primaryKey), escapeIdentifier(primaryKey),
+		strings.Join(updateSet, ", "),
+		strings.Join(insertColumns, ", "),
+		strings.Join(insertValues, ", "))
+
+	return mergeQuery, nil
+}
+
+// formatValueForSQL formats a value for use in SQL statements
+func (c *Client) formatValueForSQL(value interface{}, colType bigqueryType) string {
+	if value == nil {
+		return "NULL"
+	}
+
+	// Handle slices for REPEATED fields
+	if reflect.TypeOf(value).Kind() == reflect.Slice {
+		sliceValue := reflect.ValueOf(value)
+		if sliceValue.Len() == 0 {
+			return "NULL"
+		}
+
+		var elements []string
+		for i := 0; i < sliceValue.Len(); i++ {
+			elem := sliceValue.Index(i).Interface()
+			// Format each element based on its type
+			elemStr := c.formatValueForSQL(elem, colType)
+			elements = append(elements, elemStr)
+		}
+		return fmt.Sprintf("[%s]", strings.Join(elements, ", "))
+	}
+
+	switch colType {
+	case TypeString, TypeJSON:
+		// Escape single quotes and wrap in quotes
+		str := fmt.Sprintf("%v", value)
+		escaped := strings.ReplaceAll(str, "'", "\\'")
+		return fmt.Sprintf("'%s'", escaped)
+	case TypeInt64, TypeInteger:
+		return fmt.Sprintf("%d", value)
+	case TypeFloat64, TypeFloat:
+		return fmt.Sprintf("%f", value)
+	case TypeBoolean:
+		return fmt.Sprintf("%t", value)
+	case TypeTimestamp:
+		if t, ok := value.(time.Time); ok {
+			return fmt.Sprintf("TIMESTAMP('%s')", t.Format(time.RFC3339))
+		}
+		return fmt.Sprintf("TIMESTAMP('%v')", value)
+	case TypeBytes:
+		// For bytes, convert to hex string
+		if b, ok := value.([]byte); ok {
+			return fmt.Sprintf("B'%x'", b)
+		}
+		return fmt.Sprintf("B'%v'", value)
+	default:
+		// Default to string representation
+		str := fmt.Sprintf("%v", value)
+		escaped := strings.ReplaceAll(str, "'", "\\'")
+		return fmt.Sprintf("'%s'", escaped)
+	}
 }
 
 // DeleteRows deletes rows from a BigQuery table
