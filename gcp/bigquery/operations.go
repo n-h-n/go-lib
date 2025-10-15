@@ -648,6 +648,26 @@ func (c *Client) formatValueForSQL(value interface{}, colType bigqueryType) stri
 			return "NULL"
 		}
 
+		// For JSON type columns, serialize the entire slice as JSON
+		if colType == TypeJSON {
+			jsonBytes, err := json.Marshal(value)
+			if err != nil {
+				// Fallback to array format if JSON marshaling fails
+				var elements []string
+				for i := 0; i < sliceValue.Len(); i++ {
+					elem := sliceValue.Index(i).Interface()
+					elemStr := c.formatValueForSQL(elem, colType)
+					elements = append(elements, elemStr)
+				}
+				return fmt.Sprintf("[%s]", strings.Join(elements, ", "))
+			}
+			// Return as PARSE_JSON for JSON type
+			jsonStr := string(jsonBytes)
+			escaped := strings.ReplaceAll(jsonStr, "'", "\\'")
+			return fmt.Sprintf("PARSE_JSON('%s')", escaped)
+		}
+
+		// For REPEATED fields, format each element individually
 		var elements []string
 		for i := 0; i < sliceValue.Len(); i++ {
 			elem := sliceValue.Index(i).Interface()
