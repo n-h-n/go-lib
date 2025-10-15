@@ -672,10 +672,8 @@ func (c *Client) formatValueForSQL(value interface{}, colType bigqueryType) stri
 				escaped := strings.ReplaceAll(str, "'", "\\'")
 				return fmt.Sprintf("'%s'", escaped)
 			}
-			// Escape single quotes in JSON and wrap in quotes
-			jsonStr := string(jsonBytes)
-			escaped := strings.ReplaceAll(jsonStr, "'", "\\'")
-			return fmt.Sprintf("'%s'", escaped)
+			// Return JSON literal without quotes for BigQuery
+			return string(jsonBytes)
 		}
 		// For non-struct values, treat as string
 		str := fmt.Sprintf("%v", value)
