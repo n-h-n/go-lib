@@ -460,8 +460,8 @@ func (c *Client) HasPrimaryKeyConstraint(tableName string) (bool, error) {
 	query := fmt.Sprintf(`
 		SELECT COUNT(*) as constraint_count
 		FROM %s.%s.INFORMATION_SCHEMA.TABLE_CONSTRAINTS
-		WHERE table_name = %s AND constraint_type = 'PRIMARY KEY'
-	`, c.projectID, c.datasetID, escapeIdentifier(tableName))
+		WHERE table_name = '%s' AND constraint_type = 'PRIMARY KEY'
+	`, c.projectID, c.datasetID, tableName)
 
 	if c.verboseMode {
 		log.Log.Debugf(c.ctx, "checking for primary key constraints: %s", query)
