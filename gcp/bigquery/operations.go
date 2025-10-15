@@ -574,10 +574,21 @@ func (c *Client) buildMergeQuery(row Row) (string, error) {
 	// Find primary key column
 	var primaryKey string
 
-	for colName, col := range *cols {
-		if col.Mode == "REQUIRED" { // Primary key equivalent
-			primaryKey = colName
-			break
+	// First try to use the table's PrimaryKeyName if available
+	if table.PrimaryKeyName != "" {
+		primaryKey = table.PrimaryKeyName
+	} else {
+		// Fallback: look for a column named "id" (common convention)
+		if _, exists := (*cols)["id"]; exists {
+			primaryKey = "id"
+		} else {
+			// Last resort: use the first REQUIRED column
+			for colName, col := range *cols {
+				if col.Mode == "REQUIRED" {
+					primaryKey = colName
+					break
+				}
+			}
 		}
 	}
 
