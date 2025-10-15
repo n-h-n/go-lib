@@ -719,7 +719,7 @@ func (c *Client) UpsertRows(rows ...Row) error {
 		// Execute MERGE statement
 		err = c.ExecuteDML(c.ctx, mergeQuery)
 		if err != nil {
-			return fmt.Errorf("failed to upsert row in table %s: %w", table.Name, err)
+			return fmt.Errorf("failed to upsert row in table %s: %w, query: %s", table.Name, err, mergeQuery)
 		}
 	}
 
