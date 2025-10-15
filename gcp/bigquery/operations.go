@@ -589,6 +589,7 @@ func (c *Client) buildMergeQuery(row Row) (string, error) {
 	var insertColumns []string
 	var insertValues []string
 	var updateSet []string
+	var sourceSelect []string
 
 	for colName, col := range *cols {
 		// Format value for SQL
@@ -596,6 +597,9 @@ func (c *Client) buildMergeQuery(row Row) (string, error) {
 
 		insertColumns = append(insertColumns, escapeIdentifier(colName))
 		insertValues = append(insertValues, formattedValue)
+
+		// Build source SELECT clause: value AS column_name
+		sourceSelect = append(sourceSelect, fmt.Sprintf("%s AS %s", formattedValue, escapeIdentifier(colName)))
 
 		// For UPDATE SET, exclude the primary key
 		if colName != primaryKey {
@@ -607,7 +611,7 @@ func (c *Client) buildMergeQuery(row Row) (string, error) {
 	mergeQuery := fmt.Sprintf(`
 		MERGE %s.%s.%s AS target
 		USING (
-			SELECT %s AS %s
+			SELECT %s
 		) AS source
 		ON target.%s = source.%s
 		WHEN MATCHED THEN
@@ -616,15 +620,15 @@ func (c *Client) buildMergeQuery(row Row) (string, error) {
 			INSERT (%s)
 			VALUES (%s)`,
 		c.projectID, c.datasetID, table.Name,
-		strings.Join(insertValues, ", "), strings.Join(insertColumns, ", "),
+		strings.Join(sourceSelect, ", "),
 		escapeIdentifier(primaryKey), escapeIdentifier(primaryKey),
 		strings.Join(updateSet, ", "),
 		strings.Join(insertColumns, ", "),
 		strings.Join(insertValues, ", "))
 
 	// Debug logging - always log for debugging
-	log.Log.Debugf(c.ctx, "MERGE query components - PrimaryKey: %s, InsertColumns: %v, InsertValues: %v, UpdateSet: %v",
-		primaryKey, insertColumns, insertValues, updateSet)
+	log.Log.Debugf(c.ctx, "MERGE query components - PrimaryKey: %s, SourceSelect: %v, InsertColumns: %v, InsertValues: %v, UpdateSet: %v",
+		primaryKey, sourceSelect, insertColumns, insertValues, updateSet)
 
 	return mergeQuery, nil
 }
