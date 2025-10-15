@@ -153,6 +153,19 @@ func (c *Client) CreateTable(table *Table, opts ...func(*createTableOpts)) error
 		return fmt.Errorf("failed to create table: %w", err)
 	}
 
+	// Set primary key constraint if we have a primary key
+	if table.PrimaryKeyName != "" {
+		if c.verboseMode {
+			log.Log.Debugf(c.ctx, "setting primary key constraint on newly created table %s for column %s", table.Name, table.PrimaryKeyName)
+		}
+		if err = c.SetPrimaryKeyConstraint(table.Name, table.PrimaryKeyName); err != nil {
+			// Log the error but don't fail table creation
+			if c.verboseMode {
+				log.Log.Debugf(c.ctx, "warning: could not set primary key constraint on table %s: %v", table.Name, err)
+			}
+		}
+	}
+
 	if c.verboseMode {
 		log.Log.Debugf(c.ctx, "created table %s in dataset %s", table.Name, c.datasetID)
 	}
@@ -293,6 +306,22 @@ func (c *Client) AlignTableSchema(table *Table, opts ...func(*alignTableOpts)) e
 		return nil
 	}
 
+	// Set primary key constraint if we have a primary key and it's not already set
+	if table.PrimaryKeyName != "" {
+		hasConstraint, err := c.HasPrimaryKeyConstraint(table.Name)
+		if err != nil {
+			return fmt.Errorf("could not check if primary key constraint exists: %w", err)
+		}
+		if !hasConstraint {
+			if c.verboseMode {
+				log.Log.Debugf(c.ctx, "setting primary key constraint on table %s for column %s", table.Name, table.PrimaryKeyName)
+			}
+			if err = c.SetPrimaryKeyConstraint(table.Name, table.PrimaryKeyName); err != nil {
+				return fmt.Errorf("could not set primary key constraint: %w", err)
+			}
+		}
+	}
+
 	// Check if schema is aligned
 	aligned, err := c.IsSchemaAligned(table, opts...)
 	if err != nil {
@@ -349,6 +378,109 @@ func (c *Client) detectPrimaryKeyFromColumns(table *Table) string {
 	}
 
 	return ""
+}
+
+// SetPrimaryKeyConstraint sets a primary key constraint on an existing BigQuery table
+func (c *Client) SetPrimaryKeyConstraint(tableName, primaryKeyColumn string) error {
+	if tableName == "" {
+		return fmt.Errorf("table name cannot be empty")
+	}
+	if primaryKeyColumn == "" {
+		return fmt.Errorf("primary key column cannot be empty")
+	}
+
+	// Validate table name
+	if err := validateTableName(tableName); err != nil {
+		return fmt.Errorf("invalid table name: %w", err)
+	}
+
+	// Check if table exists
+	exists, err := c.IsTableExistent(&Table{Name: tableName})
+	if err != nil {
+		return fmt.Errorf("could not check if table exists: %w", err)
+	}
+	if !exists {
+		return fmt.Errorf("table %s does not exist", tableName)
+	}
+
+	// Check if primary key constraint already exists
+	hasConstraint, err := c.HasPrimaryKeyConstraint(tableName)
+	if err != nil {
+		return fmt.Errorf("could not check if primary key constraint exists: %w", err)
+	}
+	if hasConstraint {
+		if c.verboseMode {
+			log.Log.Debugf(c.ctx, "primary key constraint already exists on table %s", tableName)
+		}
+		return nil
+	}
+
+	// Generate constraint name
+	constraintName := fmt.Sprintf("pk_%s_%s", tableName, primaryKeyColumn)
+	if len(constraintName) > 63 {
+		// Truncate to 63 characters (BigQuery limit)
+		constraintName = constraintName[:63]
+	}
+
+	// Build ALTER TABLE statement to add primary key constraint
+	alterQuery := fmt.Sprintf(`
+		ALTER TABLE %s.%s.%s
+		ADD CONSTRAINT %s PRIMARY KEY (%s) NOT ENFORCED
+	`, c.projectID, c.datasetID, tableName, escapeIdentifier(constraintName), escapeIdentifier(primaryKeyColumn))
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "setting primary key constraint on table %s: %s", tableName, alterQuery)
+	}
+
+	// Execute ALTER TABLE statement
+	err = c.ExecuteDML(c.ctx, alterQuery)
+	if err != nil {
+		return fmt.Errorf("failed to set primary key constraint: %w", err)
+	}
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "successfully set primary key constraint on table %s", tableName)
+	}
+
+	return nil
+}
+
+// HasPrimaryKeyConstraint checks if a table has a primary key constraint
+func (c *Client) HasPrimaryKeyConstraint(tableName string) (bool, error) {
+	if tableName == "" {
+		return false, fmt.Errorf("table name cannot be empty")
+	}
+
+	// Validate table name
+	if err := validateTableName(tableName); err != nil {
+		return false, fmt.Errorf("invalid table name: %w", err)
+	}
+
+	// Query INFORMATION_SCHEMA to check for primary key constraints
+	query := fmt.Sprintf(`
+		SELECT COUNT(*) as constraint_count
+		FROM %s.%s.INFORMATION_SCHEMA.TABLE_CONSTRAINTS
+		WHERE table_name = %s AND constraint_type = 'PRIMARY KEY'
+	`, c.projectID, c.datasetID, escapeIdentifier(tableName))
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "checking for primary key constraints: %s", query)
+	}
+
+	it, err := c.ExecuteQuery(c.ctx, query)
+	if err != nil {
+		return false, fmt.Errorf("failed to check primary key constraints: %w", err)
+	}
+
+	var result struct {
+		ConstraintCount int64 `bigquery:"constraint_count"`
+	}
+	err = it.Next(&result)
+	if err != nil {
+		return false, fmt.Errorf("failed to read constraint count: %w", err)
+	}
+
+	return result.ConstraintCount > 0, nil
 }
 
 // IsSchemaAligned checks if the table schema is aligned with the provided table definition
