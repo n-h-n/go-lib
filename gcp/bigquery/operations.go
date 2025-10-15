@@ -626,9 +626,11 @@ func (c *Client) buildMergeQuery(row Row) (string, error) {
 		strings.Join(insertColumns, ", "),
 		strings.Join(insertValues, ", "))
 
-	// Debug logging - always log for debugging
-	log.Log.Debugf(c.ctx, "MERGE query components - PrimaryKey: %s, SourceSelect: %v, InsertColumns: %v, InsertValues: %v, UpdateSet: %v",
-		primaryKey, sourceSelect, insertColumns, insertValues, updateSet)
+	// Debug logging
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "MERGE query components - PrimaryKey: %s, SourceSelect: %v, InsertColumns: %v, InsertValues: %v, UpdateSet: %v",
+			primaryKey, sourceSelect, insertColumns, insertValues, updateSet)
+	}
 
 	return mergeQuery, nil
 }
