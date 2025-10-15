@@ -657,8 +657,27 @@ func (c *Client) formatValueForSQL(value interface{}, colType bigqueryType) stri
 	}
 
 	switch colType {
-	case TypeString, TypeJSON:
+	case TypeString:
 		// Escape single quotes and wrap in quotes
+		str := fmt.Sprintf("%v", value)
+		escaped := strings.ReplaceAll(str, "'", "\\'")
+		return fmt.Sprintf("'%s'", escaped)
+	case TypeJSON:
+		// For JSON type, serialize structs/pointers to JSON
+		if reflect.TypeOf(value).Kind() == reflect.Ptr || reflect.TypeOf(value).Kind() == reflect.Struct {
+			jsonBytes, err := json.Marshal(value)
+			if err != nil {
+				// Fallback to string representation if JSON marshaling fails
+				str := fmt.Sprintf("%v", value)
+				escaped := strings.ReplaceAll(str, "'", "\\'")
+				return fmt.Sprintf("'%s'", escaped)
+			}
+			// Escape single quotes in JSON and wrap in quotes
+			jsonStr := string(jsonBytes)
+			escaped := strings.ReplaceAll(jsonStr, "'", "\\'")
+			return fmt.Sprintf("'%s'", escaped)
+		}
+		// For non-struct values, treat as string
 		str := fmt.Sprintf("%v", value)
 		escaped := strings.ReplaceAll(str, "'", "\\'")
 		return fmt.Sprintf("'%s'", escaped)
