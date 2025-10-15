@@ -415,18 +415,12 @@ func (c *Client) SetPrimaryKeyConstraint(tableName, primaryKeyColumn string) err
 		return nil
 	}
 
-	// Generate constraint name
-	constraintName := fmt.Sprintf("pk_%s_%s", tableName, primaryKeyColumn)
-	if len(constraintName) > 63 {
-		// Truncate to 63 characters (BigQuery limit)
-		constraintName = constraintName[:63]
-	}
-
 	// Build ALTER TABLE statement to add primary key constraint
+	// Note: BigQuery doesn't support named primary key constraints
 	alterQuery := fmt.Sprintf(`
 		ALTER TABLE %s.%s.%s
-		ADD CONSTRAINT %s PRIMARY KEY (%s) NOT ENFORCED
-	`, c.projectID, c.datasetID, tableName, escapeIdentifier(constraintName), escapeIdentifier(primaryKeyColumn))
+		ADD PRIMARY KEY (%s) NOT ENFORCED
+	`, c.projectID, c.datasetID, tableName, escapeIdentifier(primaryKeyColumn))
 
 	if c.verboseMode {
 		log.Log.Debugf(c.ctx, "setting primary key constraint on table %s: %s", tableName, alterQuery)
