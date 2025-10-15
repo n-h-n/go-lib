@@ -551,6 +551,9 @@ func (c *Client) UpsertRows(rows ...Row) error {
 
 		if c.verboseMode {
 			log.Log.Debugf(c.ctx, "executing MERGE query for upsert in table %s: %s", table.Name, mergeQuery)
+		} else {
+			// Always log the query for debugging purposes when there's an error
+			log.Log.Debugf(c.ctx, "MERGE query: %s", mergeQuery)
 		}
 
 		// Execute MERGE statement
@@ -618,6 +621,10 @@ func (c *Client) buildMergeQuery(row Row) (string, error) {
 		strings.Join(updateSet, ", "),
 		strings.Join(insertColumns, ", "),
 		strings.Join(insertValues, ", "))
+
+	// Debug logging - always log for debugging
+	log.Log.Debugf(c.ctx, "MERGE query components - PrimaryKey: %s, InsertColumns: %v, InsertValues: %v, UpdateSet: %v",
+		primaryKey, insertColumns, insertValues, updateSet)
 
 	return mergeQuery, nil
 }
