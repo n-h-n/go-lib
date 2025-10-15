@@ -677,7 +677,7 @@ func (c *Client) formatValueForSQL(value interface{}, colType bigqueryType) stri
 			// Wrap JSON in quotes and cast to JSON type for BigQuery MERGE
 			jsonStr := string(jsonBytes)
 			escaped := strings.ReplaceAll(jsonStr, "'", "\\'")
-			return fmt.Sprintf("JSON('%s')", escaped)
+			return fmt.Sprintf("PARSE_JSON('%s')", escaped)
 		}
 		// For non-struct values, treat as string
 		str := fmt.Sprintf("%v", value)
