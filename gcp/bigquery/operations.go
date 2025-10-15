@@ -604,7 +604,7 @@ func (c *Client) buildMergeQuery(row Row) (string, error) {
 	mergeQuery := fmt.Sprintf(`
 		MERGE %s.%s.%s AS target
 		USING (
-			SELECT %s
+			SELECT %s AS %s
 		) AS source
 		ON target.%s = source.%s
 		WHEN MATCHED THEN
@@ -613,7 +613,7 @@ func (c *Client) buildMergeQuery(row Row) (string, error) {
 			INSERT (%s)
 			VALUES (%s)`,
 		c.projectID, c.datasetID, table.Name,
-		strings.Join(insertValues, ", "),
+		strings.Join(insertValues, ", "), strings.Join(insertColumns, ", "),
 		escapeIdentifier(primaryKey), escapeIdentifier(primaryKey),
 		strings.Join(updateSet, ", "),
 		strings.Join(insertColumns, ", "),
