@@ -76,6 +76,11 @@ func (c *Client) CreateTable(table *Table, opts ...func(*createTableOpts)) error
 		return fmt.Errorf("invalid table name: %w", err)
 	}
 
+	// Ensure primary key is set from table columns
+	if table.PrimaryKeyName == "" {
+		table.PrimaryKeyName = c.detectPrimaryKeyFromColumns(table)
+	}
+
 	createOpts := createTableOpts{
 		overwrite: false,
 	}
@@ -268,6 +273,11 @@ func (c *Client) AlignTableSchema(table *Table, opts ...func(*alignTableOpts)) e
 		opt(&o)
 	}
 
+	// Ensure primary key is set from table columns
+	if table.PrimaryKeyName == "" {
+		table.PrimaryKeyName = c.detectPrimaryKeyFromColumns(table)
+	}
+
 	// Check if table exists
 	exists, err := c.IsTableExistent(table)
 	if err != nil {
@@ -317,6 +327,28 @@ func (c *Client) AlignTableSchema(table *Table, opts ...func(*alignTableOpts)) e
 	}
 
 	return nil
+}
+
+// detectPrimaryKeyFromColumns detects the primary key from table columns
+func (c *Client) detectPrimaryKeyFromColumns(table *Table) string {
+	if table == nil || table.Columns == nil {
+		return ""
+	}
+
+	// Look for columns with REQUIRED mode (primary key candidates)
+	for colName, col := range *table.Columns {
+		if col.Mode == "REQUIRED" {
+			// First REQUIRED column is considered the primary key
+			return colName
+		}
+	}
+
+	// Fallback: look for a column named "id" (common convention)
+	if _, exists := (*table.Columns)["id"]; exists {
+		return "id"
+	}
+
+	return ""
 }
 
 // IsSchemaAligned checks if the table schema is aligned with the provided table definition
@@ -441,6 +473,11 @@ func (c *Client) AlterTableAddColumns(table *Table) error {
 
 	if table == nil {
 		return fmt.Errorf("unable to alter table: table cannot be nil")
+	}
+
+	// Ensure primary key is set from table columns
+	if table.PrimaryKeyName == "" {
+		table.PrimaryKeyName = c.detectPrimaryKeyFromColumns(table)
 	}
 
 	// Get current schema
