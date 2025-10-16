@@ -851,9 +851,12 @@ func (c *Client) formatValueForSQL(value interface{}, colType bigqueryType) stri
 
 	switch colType {
 	case TypeString:
-		// Escape single quotes and wrap in quotes
+		// Escape single quotes and newlines, wrap in quotes
 		str := fmt.Sprintf("%v", value)
 		escaped := strings.ReplaceAll(str, "'", "\\'")
+		escaped = strings.ReplaceAll(escaped, "\n", "\\n")
+		escaped = strings.ReplaceAll(escaped, "\r", "\\r")
+		escaped = strings.ReplaceAll(escaped, "\t", "\\t")
 		return fmt.Sprintf("'%s'", escaped)
 	case TypeJSON:
 		// For JSON type, serialize structs/pointers to JSON
@@ -863,16 +866,25 @@ func (c *Client) formatValueForSQL(value interface{}, colType bigqueryType) stri
 				// Fallback to string representation if JSON marshaling fails
 				str := fmt.Sprintf("%v", value)
 				escaped := strings.ReplaceAll(str, "'", "\\'")
+				escaped = strings.ReplaceAll(escaped, "\n", "\\n")
+				escaped = strings.ReplaceAll(escaped, "\r", "\\r")
+				escaped = strings.ReplaceAll(escaped, "\t", "\\t")
 				return fmt.Sprintf("'%s'", escaped)
 			}
 			// Wrap JSON in quotes and cast to JSON type for BigQuery MERGE
 			jsonStr := string(jsonBytes)
 			escaped := strings.ReplaceAll(jsonStr, "'", "\\'")
+			escaped = strings.ReplaceAll(escaped, "\n", "\\n")
+			escaped = strings.ReplaceAll(escaped, "\r", "\\r")
+			escaped = strings.ReplaceAll(escaped, "\t", "\\t")
 			return fmt.Sprintf("PARSE_JSON('%s')", escaped)
 		}
 		// For non-struct values, treat as string
 		str := fmt.Sprintf("%v", value)
 		escaped := strings.ReplaceAll(str, "'", "\\'")
+		escaped = strings.ReplaceAll(escaped, "\n", "\\n")
+		escaped = strings.ReplaceAll(escaped, "\r", "\\r")
+		escaped = strings.ReplaceAll(escaped, "\t", "\\t")
 		return fmt.Sprintf("'%s'", escaped)
 	case TypeInt64, TypeInteger:
 		return fmt.Sprintf("%d", value)
@@ -895,6 +907,9 @@ func (c *Client) formatValueForSQL(value interface{}, colType bigqueryType) stri
 		// Default to string representation
 		str := fmt.Sprintf("%v", value)
 		escaped := strings.ReplaceAll(str, "'", "\\'")
+		escaped = strings.ReplaceAll(escaped, "\n", "\\n")
+		escaped = strings.ReplaceAll(escaped, "\r", "\\r")
+		escaped = strings.ReplaceAll(escaped, "\t", "\\t")
 		return fmt.Sprintf("'%s'", escaped)
 	}
 }
