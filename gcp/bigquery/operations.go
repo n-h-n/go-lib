@@ -89,6 +89,16 @@ func (c *Client) CreateTable(table *Table, opts ...func(*createTableOpts)) error
 		opt(&createOpts)
 	}
 
+	// Auto-optimize for primary key clustering if enabled and not explicitly set
+	if createOpts.autoOptimize && createOpts.clustering == nil && table.PrimaryKeyName != "" {
+		createOpts.clustering = &ClusteringConfig{
+			Fields: []string{table.PrimaryKeyName},
+		}
+		if c.verboseMode {
+			log.Log.Debugf(c.ctx, "auto-optimizing table %s with clustering on primary key: %s", table.Name, table.PrimaryKeyName)
+		}
+	}
+
 	// Check if table already exists
 	exists, err := c.IsTableExistent(table)
 	if err != nil {
@@ -320,6 +330,14 @@ func (c *Client) AlignTableSchema(table *Table, opts ...func(*alignTableOpts)) e
 				return fmt.Errorf("could not set primary key constraint: %w", err)
 			}
 		}
+
+		// Optimize table for upserts by adding clustering on primary key
+		if err = c.AddClusteringToTable(table); err != nil {
+			// Log the error but don't fail schema alignment
+			if c.verboseMode {
+				log.Log.Debugf(c.ctx, "warning: could not optimize table %s for upserts: %v", table.Name, err)
+			}
+		}
 	}
 
 	// Check if schema is aligned
@@ -475,6 +493,97 @@ func (c *Client) HasPrimaryKeyConstraint(tableName string) (bool, error) {
 	}
 
 	return result.ConstraintCount > 0, nil
+}
+
+// AddClusteringToTable adds clustering to a table with flexible configuration options
+func (c *Client) AddClusteringToTable(table *Table, opts ...func(*clusteringOpts)) error {
+	if table == nil {
+		return fmt.Errorf("table cannot be nil")
+	}
+
+	// Default clustering options
+	clusteringOpts := clusteringOpts{
+		clusteringFields: nil, // Will default to primary key if not specified
+		forceRecreate:    false,
+	}
+
+	for _, opt := range opts {
+		opt(&clusteringOpts)
+	}
+
+	// Ensure primary key is set from table columns
+	if table.PrimaryKeyName == "" {
+		table.PrimaryKeyName = c.detectPrimaryKeyFromColumns(table)
+	}
+
+	// Check if table exists
+	exists, err := c.IsTableExistent(table)
+	if err != nil {
+		return fmt.Errorf("could not check if table exists: %w", err)
+	}
+	if !exists {
+		return fmt.Errorf("table %s does not exist", table.Name)
+	}
+
+	// Determine clustering fields
+	var clusteringFields []string
+	if len(clusteringOpts.clusteringFields) > 0 {
+		clusteringFields = clusteringOpts.clusteringFields
+	} else if table.PrimaryKeyName != "" {
+		clusteringFields = []string{table.PrimaryKeyName}
+	} else {
+		return fmt.Errorf("no clustering fields specified and no primary key found for table %s", table.Name)
+	}
+
+	// Check if clustering already exists
+	hasClustering, err := c.HasClustering(table.Name)
+	if err != nil {
+		return fmt.Errorf("could not check if clustering exists: %w", err)
+	}
+
+	if hasClustering && !clusteringOpts.forceRecreate {
+		if c.verboseMode {
+			log.Log.Debugf(c.ctx, "table %s already has clustering, skipping (use WithForceRecreateClustering(true) to override)", table.Name)
+		}
+		return nil
+	}
+
+	// Add clustering
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "adding clustering to table %s on fields: %v", table.Name, clusteringFields)
+	}
+
+	err = c.CreateIndex(table, WithClusteringFields(clusteringFields), WithRecreateIndex())
+	if err != nil {
+		return fmt.Errorf("failed to add clustering: %w", err)
+	}
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "successfully added clustering to table %s", table.Name)
+	}
+
+	return nil
+}
+
+// HasClustering checks if a table has clustering configured
+func (c *Client) HasClustering(tableName string) (bool, error) {
+	if tableName == "" {
+		return false, fmt.Errorf("table name cannot be empty")
+	}
+
+	// Validate table name
+	if err := validateTableName(tableName); err != nil {
+		return false, fmt.Errorf("invalid table name: %w", err)
+	}
+
+	// Get table metadata to check for clustering
+	tableRef := c.GetTableReference(tableName)
+	metadata, err := tableRef.Metadata(c.ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to get table metadata: %w", err)
+	}
+
+	return metadata.Clustering != nil && len(metadata.Clustering.Fields) > 0, nil
 }
 
 // IsSchemaAligned checks if the table schema is aligned with the provided table definition
@@ -1842,6 +1951,7 @@ type createTableOpts struct {
 	overwrite        bool
 	timePartitioning *TimePartitioning
 	clustering       *ClusteringConfig
+	autoOptimize     bool // Auto-optimize for upserts by clustering on primary key
 }
 
 func WithCreateTableOverwrite(v bool) func(*createTableOpts) {
@@ -1862,10 +1972,21 @@ func WithClustering(clustering *ClusteringConfig) func(*createTableOpts) {
 	}
 }
 
+func WithAutoOptimizeForUpserts(v bool) func(*createTableOpts) {
+	return func(opts *createTableOpts) {
+		opts.autoOptimize = v
+	}
+}
+
 type createDatasetOpts struct {
 	overwrite   bool
 	labels      map[string]string
 	description string
+}
+
+type clusteringOpts struct {
+	clusteringFields []string
+	forceRecreate    bool
 }
 
 func WithCreateDatasetOverwrite(v bool) func(*createDatasetOpts) {
@@ -1883,6 +2004,19 @@ func WithDatasetLabels(labels map[string]string) func(*createDatasetOpts) {
 func WithDatasetDescription(description string) func(*createDatasetOpts) {
 	return func(opts *createDatasetOpts) {
 		opts.description = description
+	}
+}
+
+// Clustering option functions
+func WithClusteringFieldsForTable(fields []string) func(*clusteringOpts) {
+	return func(opts *clusteringOpts) {
+		opts.clusteringFields = fields
+	}
+}
+
+func WithForceRecreateClustering(v bool) func(*clusteringOpts) {
+	return func(opts *clusteringOpts) {
+		opts.forceRecreate = v
 	}
 }
 
