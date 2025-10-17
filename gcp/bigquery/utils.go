@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"cloud.google.com/go/bigquery"
 )
 
 // normalizeBigQueryType normalizes BigQuery type names for comparison
@@ -78,6 +80,357 @@ func deserializeJSONToStruct(data interface{}, targetType reflect.Type) (interfa
 // This is useful when reading JSON columns back into structs with JSON tags
 func DeserializeJSONField(data interface{}, targetType reflect.Type) (interface{}, error) {
 	return deserializeJSONToStruct(data, targetType)
+}
+
+// CustomJSONUnmarshaler provides custom unmarshaling for BigQuery JSON fields
+type CustomJSONUnmarshaler struct {
+	// TypeRegistry maps field names to their expected Go types
+	TypeRegistry map[string]reflect.Type
+}
+
+// NewCustomJSONUnmarshaler creates a new CustomJSONUnmarshaler
+func NewCustomJSONUnmarshaler() *CustomJSONUnmarshaler {
+	return &CustomJSONUnmarshaler{
+		TypeRegistry: make(map[string]reflect.Type),
+	}
+}
+
+// RegisterType registers a field name with its expected Go type
+func (c *CustomJSONUnmarshaler) RegisterType(fieldName string, goType reflect.Type) {
+	c.TypeRegistry[fieldName] = goType
+}
+
+// UnmarshalJSONField unmarshals a JSON field to the appropriate Go type
+func (c *CustomJSONUnmarshaler) UnmarshalJSONField(fieldName string, data interface{}) (interface{}, error) {
+	// Check if we have a registered type for this field
+	if targetType, exists := c.TypeRegistry[fieldName]; exists {
+		return c.unmarshalToType(data, targetType)
+	}
+
+	// If no specific type registered, return as-is
+	return data, nil
+}
+
+// unmarshalToType handles the actual unmarshaling to a specific type
+func (c *CustomJSONUnmarshaler) unmarshalToType(data interface{}, targetType reflect.Type) (interface{}, error) {
+	if data == nil {
+		return reflect.Zero(targetType).Interface(), nil
+	}
+
+	// Handle different target types
+	switch targetType.Kind() {
+	case reflect.Slice:
+		return c.unmarshalToSlice(data, targetType)
+	case reflect.Ptr:
+		return c.unmarshalToPointer(data, targetType)
+	case reflect.Struct:
+		return c.unmarshalToStruct(data, targetType)
+	case reflect.Map:
+		return c.unmarshalToMap(data, targetType)
+	case reflect.Interface:
+		return data, nil // Keep as interface{}
+	default:
+		return c.unmarshalToBasicType(data, targetType)
+	}
+}
+
+// unmarshalToSlice handles unmarshaling to slice types (including []*struct)
+func (c *CustomJSONUnmarshaler) unmarshalToSlice(data interface{}, targetType reflect.Type) (interface{}, error) {
+	// Convert data to JSON bytes first
+	jsonBytes, err := c.dataToJSONBytes(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert data to JSON bytes: %w", err)
+	}
+
+	// Create a slice of the target type
+	sliceType := targetType
+	sliceValue := reflect.MakeSlice(sliceType, 0, 0)
+
+	// Unmarshal JSON array into the slice
+	err = json.Unmarshal(jsonBytes, sliceValue.Addr().Interface())
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JSON to slice: %w", err)
+	}
+
+	return sliceValue.Interface(), nil
+}
+
+// unmarshalToPointer handles unmarshaling to pointer types
+func (c *CustomJSONUnmarshaler) unmarshalToPointer(data interface{}, targetType reflect.Type) (interface{}, error) {
+	// Convert data to JSON bytes first
+	jsonBytes, err := c.dataToJSONBytes(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert data to JSON bytes: %w", err)
+	}
+
+	// Create a new instance of the target type
+	targetValue := reflect.New(targetType.Elem())
+
+	// Unmarshal JSON into the struct
+	err = json.Unmarshal(jsonBytes, targetValue.Interface())
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JSON to pointer: %w", err)
+	}
+
+	return targetValue.Interface(), nil
+}
+
+// unmarshalToStruct handles unmarshaling to struct types
+func (c *CustomJSONUnmarshaler) unmarshalToStruct(data interface{}, targetType reflect.Type) (interface{}, error) {
+	// Convert data to JSON bytes first
+	jsonBytes, err := c.dataToJSONBytes(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert data to JSON bytes: %w", err)
+	}
+
+	// Create a new instance of the target type
+	targetValue := reflect.New(targetType)
+
+	// Unmarshal JSON into the struct
+	err = json.Unmarshal(jsonBytes, targetValue.Interface())
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JSON to struct: %w", err)
+	}
+
+	// Return the value (not the pointer)
+	return targetValue.Elem().Interface(), nil
+}
+
+// unmarshalToMap handles unmarshaling to map types
+func (c *CustomJSONUnmarshaler) unmarshalToMap(data interface{}, targetType reflect.Type) (interface{}, error) {
+	// Convert data to JSON bytes first
+	jsonBytes, err := c.dataToJSONBytes(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert data to JSON bytes: %w", err)
+	}
+
+	// Create a new map of the target type
+	mapValue := reflect.MakeMap(targetType)
+
+	// Unmarshal JSON into the map
+	err = json.Unmarshal(jsonBytes, mapValue.Addr().Interface())
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JSON to map: %w", err)
+	}
+
+	return mapValue.Interface(), nil
+}
+
+// unmarshalToBasicType handles unmarshaling to basic types
+func (c *CustomJSONUnmarshaler) unmarshalToBasicType(data interface{}, targetType reflect.Type) (interface{}, error) {
+	// For basic types, try to convert directly
+	value := reflect.ValueOf(data)
+	if value.Type().ConvertibleTo(targetType) {
+		return value.Convert(targetType).Interface(), nil
+	}
+
+	// If direct conversion fails, try JSON unmarshaling
+	jsonBytes, err := c.dataToJSONBytes(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert data to JSON bytes: %w", err)
+	}
+
+	targetValue := reflect.New(targetType)
+	err = json.Unmarshal(jsonBytes, targetValue.Interface())
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JSON to basic type: %w", err)
+	}
+
+	return targetValue.Elem().Interface(), nil
+}
+
+// dataToJSONBytes converts various data types to JSON bytes
+func (c *CustomJSONUnmarshaler) dataToJSONBytes(data interface{}) ([]byte, error) {
+	switch v := data.(type) {
+	case string:
+		return []byte(v), nil
+	case []byte:
+		return v, nil
+	case nil:
+		return []byte("null"), nil
+	default:
+		return json.Marshal(data)
+	}
+}
+
+// UnmarshalBigQueryRow unmarshals a BigQuery row with custom JSON field handling
+func (c *CustomJSONUnmarshaler) UnmarshalBigQueryRow(row map[string]bigquery.Value, targetStruct interface{}) error {
+	targetValue := reflect.ValueOf(targetStruct)
+	if targetValue.Kind() != reflect.Ptr || targetValue.Elem().Kind() != reflect.Struct {
+		return fmt.Errorf("target must be a pointer to a struct")
+	}
+
+	targetValue = targetValue.Elem()
+	targetType := targetValue.Type()
+
+	// Iterate through struct fields
+	for i := 0; i < targetType.NumField(); i++ {
+		field := targetType.Field(i)
+		fieldValue := targetValue.Field(i)
+
+		// Get the field name from BigQuery tag or use field name
+		fieldName := c.getFieldName(field)
+		if fieldName == "" {
+			continue
+		}
+
+		// Get the value from BigQuery row
+		bigqueryValue, exists := row[fieldName]
+		if !exists {
+			continue
+		}
+
+		// Handle JSON fields specially
+		if c.isJSONField(field) {
+			unmarshaledValue, err := c.UnmarshalJSONField(fieldName, bigqueryValue)
+			if err != nil {
+				return fmt.Errorf("failed to unmarshal JSON field %s: %w", fieldName, err)
+			}
+
+			// Set the unmarshaled value
+			if err := c.setFieldValue(fieldValue, unmarshaledValue); err != nil {
+				return fmt.Errorf("failed to set field %s: %w", fieldName, err)
+			}
+		} else {
+			// Handle non-JSON fields normally
+			if err := c.setFieldValue(fieldValue, bigqueryValue); err != nil {
+				return fmt.Errorf("failed to set field %s: %w", fieldName, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// getFieldName extracts the field name from struct tags
+func (c *CustomJSONUnmarshaler) getFieldName(field reflect.StructField) string {
+	// Check for bigquery tag first
+	if bigqueryTag := field.Tag.Get("bigquery"); bigqueryTag != "" {
+		return strings.Split(bigqueryTag, ",")[0]
+	}
+
+	// Check for json tag
+	if jsonTag := field.Tag.Get("json"); jsonTag != "" {
+		jsonName := strings.Split(jsonTag, ",")[0]
+		if jsonName != "-" {
+			return jsonName
+		}
+	}
+
+	// Use field name as fallback
+	return field.Name
+}
+
+// isJSONField checks if a field should be treated as JSON
+func (c *CustomJSONUnmarshaler) isJSONField(field reflect.StructField) bool {
+	// Check if field type is JSON-compatible
+	fieldType := field.Type
+
+	// Check for JSON tag
+	if jsonTag := field.Tag.Get("json"); jsonTag != "" {
+		return true
+	}
+
+	// Check if type is complex (struct, slice, map, interface)
+	switch fieldType.Kind() {
+	case reflect.Struct:
+		// Check if struct has JSON tags
+		return hasJSONTags(fieldType)
+	case reflect.Slice, reflect.Map, reflect.Interface:
+		return true
+	case reflect.Ptr:
+		// Check if pointer points to a struct with JSON tags
+		if fieldType.Elem().Kind() == reflect.Struct {
+			return hasJSONTags(fieldType.Elem())
+		}
+	}
+
+	return false
+}
+
+// setFieldValue sets a value to a struct field
+func (c *CustomJSONUnmarshaler) setFieldValue(fieldValue reflect.Value, value interface{}) error {
+	if !fieldValue.CanSet() {
+		return fmt.Errorf("field is not settable")
+	}
+
+	if value == nil {
+		fieldValue.Set(reflect.Zero(fieldValue.Type()))
+		return nil
+	}
+
+	valueReflect := reflect.ValueOf(value)
+
+	// Try direct assignment first
+	if valueReflect.Type().AssignableTo(fieldValue.Type()) {
+		fieldValue.Set(valueReflect)
+		return nil
+	}
+
+	// Try conversion
+	if valueReflect.Type().ConvertibleTo(fieldValue.Type()) {
+		fieldValue.Set(valueReflect.Convert(fieldValue.Type()))
+		return nil
+	}
+
+	return fmt.Errorf("cannot assign value of type %s to field of type %s", valueReflect.Type(), fieldValue.Type())
+}
+
+// Convenience functions for common JSON field types
+
+// RegisterDisputesType registers the disputes field type for []*struct patterns
+func (c *CustomJSONUnmarshaler) RegisterDisputesType(disputeStructType reflect.Type) {
+	c.RegisterType("disputes", reflect.SliceOf(reflect.PointerTo(disputeStructType)))
+}
+
+// RegisterJSONFieldType is a generic function to register any JSON field type
+func (c *CustomJSONUnmarshaler) RegisterJSONFieldType(fieldName string, fieldType reflect.Type) {
+	c.RegisterType(fieldName, fieldType)
+}
+
+// UnmarshalJSONToSlice unmarshals JSON data directly to a slice type
+func UnmarshalJSONToSlice(data interface{}, sliceType reflect.Type) (interface{}, error) {
+	unmarshaler := NewCustomJSONUnmarshaler()
+	return unmarshaler.unmarshalToSlice(data, sliceType)
+}
+
+// UnmarshalJSONToStruct unmarshals JSON data directly to a struct type
+func UnmarshalJSONToStruct(data interface{}, structType reflect.Type) (interface{}, error) {
+	unmarshaler := NewCustomJSONUnmarshaler()
+	return unmarshaler.unmarshalToStruct(data, structType)
+}
+
+// UnmarshalJSONToPointer unmarshals JSON data directly to a pointer type
+func UnmarshalJSONToPointer(data interface{}, pointerType reflect.Type) (interface{}, error) {
+	unmarshaler := NewCustomJSONUnmarshaler()
+	return unmarshaler.unmarshalToPointer(data, pointerType)
+}
+
+// CreateJSONFieldTypeMap creates a map of field names to types for common patterns
+func CreateJSONFieldTypeMap(fieldTypes map[string]reflect.Type) map[string]reflect.Type {
+	return fieldTypes
+}
+
+// Example usage functions for common patterns
+
+// ExampleDisputeStruct represents a typical dispute struct that might be used in JSON fields
+type ExampleDisputeStruct struct {
+	CreatedAt time.Time `json:"created_at,omitempty"`
+	ID        string    `json:"id,omitempty"`
+	Memo      string    `json:"memo,omitempty"`
+	Type      string    `json:"type,omitempty"`
+}
+
+// GetDisputesType returns the reflect.Type for []*ExampleDisputeStruct
+func GetDisputesType() reflect.Type {
+	return reflect.SliceOf(reflect.PointerTo(reflect.TypeOf(ExampleDisputeStruct{})))
+}
+
+// CreateDisputesUnmarshaler creates a pre-configured unmarshaler for disputes fields
+func CreateDisputesUnmarshaler(disputeStructType reflect.Type) *CustomJSONUnmarshaler {
+	unmarshaler := NewCustomJSONUnmarshaler()
+	unmarshaler.RegisterDisputesType(disputeStructType)
+	return unmarshaler
 }
 
 // goTypeToBigQueryType converts Go types to BigQuery types

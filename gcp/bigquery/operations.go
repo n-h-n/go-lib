@@ -1083,6 +1083,99 @@ func (c *Client) Query(query string) (*bigquery.RowIterator, error) {
 	return c.ExecuteQuery(c.ctx, query)
 }
 
+// QueryWithCustomUnmarshaling executes a SELECT query and unmarshals results using custom JSON handling
+func (c *Client) QueryWithCustomUnmarshaling(query string, targetStruct interface{}, jsonFieldTypes map[string]reflect.Type) error {
+	// Execute the query
+	it, err := c.ExecuteQuery(c.ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to execute query: %w", err)
+	}
+
+	// Create custom unmarshaling
+	unmarshaler := NewCustomJSONUnmarshaler()
+
+	// Register JSON field types
+	for fieldName, fieldType := range jsonFieldTypes {
+		unmarshaler.RegisterType(fieldName, fieldType)
+	}
+
+	// Process each row
+	for {
+		var row map[string]bigquery.Value
+		err := it.Next(&row)
+		if err != nil {
+			if err.Error() == "iterator done" {
+				break
+			}
+			return fmt.Errorf("failed to read row: %w", err)
+		}
+
+		// Unmarshal the row into the target struct
+		err = unmarshaler.UnmarshalBigQueryRow(row, targetStruct)
+		if err != nil {
+			return fmt.Errorf("failed to unmarshal row: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// QueryRowsWithCustomUnmarshaling executes a SELECT query and returns all rows with custom JSON handling
+func (c *Client) QueryRowsWithCustomUnmarshaling(query string, targetSlice interface{}, jsonFieldTypes map[string]reflect.Type) error {
+	// Execute the query
+	it, err := c.ExecuteQuery(c.ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to execute query: %w", err)
+	}
+
+	// Validate target slice
+	targetValue := reflect.ValueOf(targetSlice)
+	if targetValue.Kind() != reflect.Ptr || targetValue.Elem().Kind() != reflect.Slice {
+		return fmt.Errorf("target must be a pointer to a slice")
+	}
+
+	sliceValue := targetValue.Elem()
+	elementType := sliceValue.Type().Elem()
+
+	// Create custom unmarshaling
+	unmarshaler := NewCustomJSONUnmarshaler()
+
+	// Register JSON field types
+	for fieldName, fieldType := range jsonFieldTypes {
+		unmarshaler.RegisterType(fieldName, fieldType)
+	}
+
+	// Process each row
+	for {
+		var row map[string]bigquery.Value
+		err := it.Next(&row)
+		if err != nil {
+			if err.Error() == "iterator done" {
+				break
+			}
+			return fmt.Errorf("failed to read row: %w", err)
+		}
+
+		// Create a new element
+		elementValue := reflect.New(elementType)
+
+		// Unmarshal the row into the element
+		err = unmarshaler.UnmarshalBigQueryRow(row, elementValue.Interface())
+		if err != nil {
+			return fmt.Errorf("failed to unmarshal row: %w", err)
+		}
+
+		// Append to slice
+		if elementType.Kind() == reflect.Ptr {
+			sliceValue.Set(reflect.Append(sliceValue, elementValue))
+		} else {
+			sliceValue.Set(reflect.Append(sliceValue, elementValue.Elem()))
+		}
+	}
+
+	return nil
+}
+
 // QueryWithParams executes a parameterized query
 func (c *Client) QueryWithParams(query string, params map[string]interface{}) (*bigquery.RowIterator, error) {
 	if c.verboseMode {
