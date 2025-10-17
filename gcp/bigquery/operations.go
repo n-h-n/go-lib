@@ -790,38 +790,18 @@ func (c *Client) UpsertRows(rows ...Row) error {
 		return fmt.Errorf("no rows to upsert")
 	}
 
-	for idx, row := range rows {
+	for _, row := range rows {
 		if row == nil {
 			return fmt.Errorf("row cannot be nil")
 		}
 
 		table := row.Table()
 
-		// Check if table exists
-		exists, err := c.IsTableExistent(table)
-		if err != nil {
-			return fmt.Errorf("failed to upsert: could not check if table %s exists: %w", table.Name, err)
-		}
-		if !exists {
-			return fmt.Errorf("failed to upsert: table %s does not exist", table.Name)
-		}
-
-		// Check if schema is aligned
-		aligned, err := c.IsSchemaAligned(table)
-		if err != nil {
-			return fmt.Errorf("failed to upsert: could not check if schema is aligned: %w", err)
-		}
-		if !aligned {
-			return fmt.Errorf("failed to upsert: schema is not aligned")
-		}
-
 		// Build MERGE statement for upsert
 		mergeQuery, err := c.buildMergeQuery(row)
 		if err != nil {
 			return fmt.Errorf("failed to build merge query: %w", err)
 		}
-
-		log.Log.Infof(c.ctx, "upserting row %d of %d in table %s", idx+1, len(rows), table.Name)
 
 		if c.verboseMode {
 			log.Log.Debugf(c.ctx, "executing MERGE query for upsert in table %s: %s", table.Name, mergeQuery)
