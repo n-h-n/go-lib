@@ -790,7 +790,7 @@ func (c *Client) UpsertRows(rows ...Row) error {
 		return fmt.Errorf("no rows to upsert")
 	}
 
-	for _, row := range rows {
+	for idx, row := range rows {
 		if row == nil {
 			return fmt.Errorf("row cannot be nil")
 		}
@@ -820,6 +820,8 @@ func (c *Client) UpsertRows(rows ...Row) error {
 		if err != nil {
 			return fmt.Errorf("failed to build merge query: %w", err)
 		}
+
+		log.Log.Infof(c.ctx, "upserting row %d of %d in table %s", idx+1, len(rows), table.Name)
 
 		if c.verboseMode {
 			log.Log.Debugf(c.ctx, "executing MERGE query for upsert in table %s: %s", table.Name, mergeQuery)
