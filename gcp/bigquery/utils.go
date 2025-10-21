@@ -142,17 +142,17 @@ func (c *CustomJSONUnmarshaler) unmarshalToSlice(data interface{}, targetType re
 		return nil, fmt.Errorf("failed to convert data to JSON bytes: %w", err)
 	}
 
-	// Create a slice of the target type
-	sliceType := targetType
-	sliceValue := reflect.MakeSlice(sliceType, 0, 0)
+	// Create a pointer to a slice of the target type
+	slicePtrValue := reflect.New(targetType)
 
-	// Unmarshal JSON array into the slice
-	err = json.Unmarshal(jsonBytes, sliceValue.Addr().Interface())
+	// Unmarshal JSON array into the slice pointer
+	err = json.Unmarshal(jsonBytes, slicePtrValue.Interface())
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal JSON to slice: %w", err)
 	}
 
-	return sliceValue.Interface(), nil
+	// Return the slice value (dereference the pointer)
+	return slicePtrValue.Elem().Interface(), nil
 }
 
 // unmarshalToPointer handles unmarshaling to pointer types
@@ -361,6 +361,14 @@ func (c *CustomJSONUnmarshaler) setFieldValue(fieldValue reflect.Value, value in
 
 	valueReflect := reflect.ValueOf(value)
 
+	// Handle pointer to slice assignment to slice field
+	if valueReflect.Type().Kind() == reflect.Ptr && valueReflect.Elem().Type().Kind() == reflect.Slice {
+		if fieldValue.Type().Kind() == reflect.Slice && valueReflect.Elem().Type().AssignableTo(fieldValue.Type()) {
+			fieldValue.Set(valueReflect.Elem())
+			return nil
+		}
+	}
+
 	// Try direct assignment first
 	if valueReflect.Type().AssignableTo(fieldValue.Type()) {
 		fieldValue.Set(valueReflect)
@@ -555,19 +563,19 @@ func bigQueryDefaultValue(t reflect.Type) (interface{}, error) {
 }
 
 // GetColumns extracts columns from a struct using db tags, similar to PostgreSQL version
-func GetColumns(s interface{}) (*map[string]Column, string) {
+func GetColumns(s interface{}) (*map[string]Column, []string) {
 	columns := make(map[string]Column)
-	pkey := ""
+	var pkeys []string
 
 	v := reflect.ValueOf(s)
 	if v.Kind() == reflect.Ptr && !v.IsNil() {
 		v = v.Elem()
 	} else if v.Kind() == reflect.Ptr && v.IsNil() {
-		return &columns, pkey
+		return &columns, pkeys
 	}
 
 	if v.Kind() != reflect.Struct {
-		return &columns, pkey
+		return &columns, pkeys
 	}
 
 	t := v.Type()
@@ -595,7 +603,7 @@ func GetColumns(s interface{}) (*map[string]Column, string) {
 			for _, tagPart := range tagParts[1:] {
 				if tagPart == "primarykey" {
 					c.Mode = "REQUIRED"
-					pkey = c.Name
+					pkeys = append(pkeys, c.Name)
 				}
 				if tagPart == "nonnullable" || tagPart == "required" {
 					c.Mode = "REQUIRED"
@@ -633,26 +641,17 @@ func GetColumns(s interface{}) (*map[string]Column, string) {
 		columns[tagParts[0]] = c
 	}
 
-	err := ValidateColumns(&columns)
+	err := ValidateColumnsWithMultiplePrimaryKeys(&columns)
 	if err != nil {
 		panic(err)
 	}
 
-	return &columns, pkey
+	return &columns, pkeys
 }
 
-// ValidateColumns validates column definitions
-func ValidateColumns(columns *map[string]Column) error {
-	pkey := ""
-	for _, c := range *columns {
-		if c.Mode == "REQUIRED" && strings.Contains(string(c.Type), "primarykey") {
-			if pkey != "" {
-				return fmt.Errorf("multiple primary keys defined on both %s and %s", pkey, c.Name)
-			}
-			pkey = c.Name
-		}
-	}
-
+// ValidateColumnsWithMultiplePrimaryKeys validates column definitions allowing multiple primary keys
+func ValidateColumnsWithMultiplePrimaryKeys(columns *map[string]Column) error {
+	// No validation needed for multiple primary keys - BigQuery supports them
 	return nil
 }
 
@@ -719,7 +718,7 @@ func convertFromBigQuerySchema(schema *Schema) (*Table, error) {
 	}
 
 	columns := make(map[string]Column)
-	pkey := ""
+	var pkeys []string
 
 	for _, field := range schema.Fields {
 		column := Column{
@@ -731,16 +730,16 @@ func convertFromBigQuerySchema(schema *Schema) (*Table, error) {
 
 		// Determine if this is a primary key (REQUIRED mode in BigQuery)
 		if field.Mode == "REQUIRED" {
-			pkey = field.Name
+			pkeys = append(pkeys, field.Name)
 		}
 
 		columns[field.Name] = column
 	}
 
 	table := &Table{
-		Name:           "", // Will be set by caller
-		Columns:        &columns,
-		PrimaryKeyName: pkey,
+		Name:            "", // Will be set by caller
+		Columns:         &columns,
+		PrimaryKeyNames: pkeys,
 	}
 
 	return table, nil

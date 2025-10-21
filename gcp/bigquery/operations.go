@@ -10,6 +10,7 @@ import (
 	"cloud.google.com/go/bigquery"
 	"github.com/n-h-n/go-lib/log"
 	"github.com/n-h-n/go-lib/utils"
+	"google.golang.org/api/iterator"
 )
 
 // rowValueSaver implements bigquery.ValueSaver for Row interface
@@ -76,9 +77,9 @@ func (c *Client) CreateTable(table *Table, opts ...func(*createTableOpts)) error
 		return fmt.Errorf("invalid table name: %w", err)
 	}
 
-	// Ensure primary key is set from table columns
-	if table.PrimaryKeyName == "" {
-		table.PrimaryKeyName = c.detectPrimaryKeyFromColumns(table)
+	// Ensure primary keys are set from table columns
+	if len(table.PrimaryKeyNames) == 0 {
+		table.PrimaryKeyNames = c.detectPrimaryKeysFromColumns(table)
 	}
 
 	createOpts := createTableOpts{
@@ -90,12 +91,12 @@ func (c *Client) CreateTable(table *Table, opts ...func(*createTableOpts)) error
 	}
 
 	// Auto-optimize for primary key clustering if enabled and not explicitly set
-	if createOpts.autoOptimize && createOpts.clustering == nil && table.PrimaryKeyName != "" {
+	if createOpts.autoOptimize && createOpts.clustering == nil && len(table.PrimaryKeyNames) > 0 {
 		createOpts.clustering = &ClusteringConfig{
-			Fields: []string{table.PrimaryKeyName},
+			Fields: table.PrimaryKeyNames,
 		}
 		if c.verboseMode {
-			log.Log.Debugf(c.ctx, "auto-optimizing table %s with clustering on primary key: %s", table.Name, table.PrimaryKeyName)
+			log.Log.Debugf(c.ctx, "auto-optimizing table %s with clustering on primary keys: %v", table.Name, table.PrimaryKeyNames)
 		}
 	}
 
@@ -107,8 +108,22 @@ func (c *Client) CreateTable(table *Table, opts ...func(*createTableOpts)) error
 
 	if exists && !createOpts.overwrite {
 		if c.verboseMode {
-			log.Log.Debugf(c.ctx, "table %s already exists in dataset %s, overwrite option is false, skipping", table.Name, c.datasetID)
+			log.Log.Debugf(c.ctx, "table %s already exists in dataset %s, overwrite option is false, ensuring primary key constraints are set", table.Name, c.datasetID)
 		}
+
+		// Even if table exists, ensure primary key constraints are set
+		if len(table.PrimaryKeyNames) > 0 {
+			if c.verboseMode {
+				log.Log.Debugf(c.ctx, "setting primary key constraints on existing table %s for columns %v", table.Name, table.PrimaryKeyNames)
+			}
+			if err = c.SetPrimaryKeyConstraints(table.Name, table.PrimaryKeyNames); err != nil {
+				// Log the error but don't fail the operation
+				if c.verboseMode {
+					log.Log.Debugf(c.ctx, "warning: could not set primary key constraints on existing table %s: %v", table.Name, err)
+				}
+			}
+		}
+
 		return nil
 	}
 
@@ -163,15 +178,15 @@ func (c *Client) CreateTable(table *Table, opts ...func(*createTableOpts)) error
 		return fmt.Errorf("failed to create table: %w", err)
 	}
 
-	// Set primary key constraint if we have a primary key
-	if table.PrimaryKeyName != "" {
+	// Set primary key constraints if we have primary keys
+	if len(table.PrimaryKeyNames) > 0 {
 		if c.verboseMode {
-			log.Log.Debugf(c.ctx, "setting primary key constraint on newly created table %s for column %s", table.Name, table.PrimaryKeyName)
+			log.Log.Debugf(c.ctx, "setting primary key constraints on newly created table %s for columns %v", table.Name, table.PrimaryKeyNames)
 		}
-		if err = c.SetPrimaryKeyConstraint(table.Name, table.PrimaryKeyName); err != nil {
+		if err = c.SetPrimaryKeyConstraints(table.Name, table.PrimaryKeyNames); err != nil {
 			// Log the error but don't fail table creation
 			if c.verboseMode {
-				log.Log.Debugf(c.ctx, "warning: could not set primary key constraint on table %s: %v", table.Name, err)
+				log.Log.Debugf(c.ctx, "warning: could not set primary key constraints on table %s: %v", table.Name, err)
 			}
 		}
 	}
@@ -296,42 +311,42 @@ func (c *Client) AlignTableSchema(table *Table, opts ...func(*alignTableOpts)) e
 		opt(&o)
 	}
 
-	// Ensure primary key is set from table columns
-	if table.PrimaryKeyName == "" {
-		table.PrimaryKeyName = c.detectPrimaryKeyFromColumns(table)
+	// Ensure primary keys are set from table columns
+	if len(table.PrimaryKeyNames) == 0 {
+		table.PrimaryKeyNames = c.detectPrimaryKeysFromColumns(table)
 	}
 
-	// Check if table exists
-	exists, err := c.IsTableExistent(table)
-	if err != nil {
-		return fmt.Errorf("could not check if table exists: %w", err)
-	}
-	if !exists {
-		if c.verboseMode {
-			log.Log.Debugf(c.ctx, "table %s does not exist in %s, creating....", table.Name, c.datasetID)
-		}
-		if err = c.CreateTable(table); err != nil {
-			return fmt.Errorf("could not create table: %w", err)
-		}
-		return nil
-	}
+	// // Check if table exists
+	// exists, err := c.IsTableExistent(table)
+	// if err != nil {
+	// 	return fmt.Errorf("could not check if table exists: %w", err)
+	// }
+	// if !exists {
+	// 	if c.verboseMode {
+	// 		log.Log.Debugf(c.ctx, "table %s does not exist in %s, creating....", table.Name, c.datasetID)
+	// 	}
+	// 	if err = c.CreateTable(table); err != nil {
+	// 		return fmt.Errorf("could not create table: %w", err)
+	// 	}
+	// 	return nil
+	// }
 
-	// Set primary key constraint if we have a primary key and it's not already set
-	if table.PrimaryKeyName != "" {
+	// Set primary key constraints if we have primary keys and they're not already set
+	if len(table.PrimaryKeyNames) > 0 {
 		hasConstraint, err := c.HasPrimaryKeyConstraint(table.Name)
 		if err != nil {
 			return fmt.Errorf("could not check if primary key constraint exists: %w", err)
 		}
 		if !hasConstraint {
 			if c.verboseMode {
-				log.Log.Debugf(c.ctx, "setting primary key constraint on table %s for column %s", table.Name, table.PrimaryKeyName)
+				log.Log.Debugf(c.ctx, "setting primary key constraints on table %s for columns %v", table.Name, table.PrimaryKeyNames)
 			}
-			if err = c.SetPrimaryKeyConstraint(table.Name, table.PrimaryKeyName); err != nil {
-				return fmt.Errorf("could not set primary key constraint: %w", err)
+			if err = c.SetPrimaryKeyConstraints(table.Name, table.PrimaryKeyNames); err != nil {
+				return fmt.Errorf("could not set primary key constraints: %w", err)
 			}
 		}
 
-		// Optimize table for upserts by adding clustering on primary key
+		// Optimize table for upserts by adding clustering on primary keys
 		if err = c.AddClusteringToTable(table); err != nil {
 			// Log the error but don't fail schema alignment
 			if c.verboseMode {
@@ -376,26 +391,28 @@ func (c *Client) AlignTableSchema(table *Table, opts ...func(*alignTableOpts)) e
 	return nil
 }
 
-// detectPrimaryKeyFromColumns detects the primary key from table columns
-func (c *Client) detectPrimaryKeyFromColumns(table *Table) string {
+// detectPrimaryKeysFromColumns detects all primary keys from table columns
+func (c *Client) detectPrimaryKeysFromColumns(table *Table) []string {
 	if table == nil || table.Columns == nil {
-		return ""
+		return nil
 	}
 
+	var pkeys []string
 	// Look for columns with REQUIRED mode (primary key candidates)
 	for colName, col := range *table.Columns {
 		if col.Mode == "REQUIRED" {
-			// First REQUIRED column is considered the primary key
-			return colName
+			pkeys = append(pkeys, colName)
 		}
 	}
 
-	// Fallback: look for a column named "id" (common convention)
-	if _, exists := (*table.Columns)["id"]; exists {
-		return "id"
+	// If no REQUIRED columns found, fallback to "id" column if it exists
+	if len(pkeys) == 0 {
+		if _, exists := (*table.Columns)["id"]; exists {
+			pkeys = append(pkeys, "id")
+		}
 	}
 
-	return ""
+	return pkeys
 }
 
 // SetPrimaryKeyConstraint sets a primary key constraint on an existing BigQuery table
@@ -410,15 +427,6 @@ func (c *Client) SetPrimaryKeyConstraint(tableName, primaryKeyColumn string) err
 	// Validate table name
 	if err := validateTableName(tableName); err != nil {
 		return fmt.Errorf("invalid table name: %w", err)
-	}
-
-	// Check if table exists
-	exists, err := c.IsTableExistent(&Table{Name: tableName})
-	if err != nil {
-		return fmt.Errorf("could not check if table exists: %w", err)
-	}
-	if !exists {
-		return fmt.Errorf("table %s does not exist", tableName)
 	}
 
 	// Check if primary key constraint already exists
@@ -455,6 +463,191 @@ func (c *Client) SetPrimaryKeyConstraint(tableName, primaryKeyColumn string) err
 	}
 
 	return nil
+}
+
+// SetPrimaryKeyConstraints sets primary key constraints on an existing BigQuery table
+func (c *Client) SetPrimaryKeyConstraints(tableName string, primaryKeyColumns []string) error {
+	if tableName == "" {
+		return fmt.Errorf("table name cannot be empty")
+	}
+	if len(primaryKeyColumns) == 0 {
+		return fmt.Errorf("primary key columns cannot be empty")
+	}
+
+	// Check if primary key constraint already exists
+	hasConstraint, err := c.HasPrimaryKeyConstraint(tableName)
+	if err != nil {
+		return fmt.Errorf("could not check if primary key constraint exists: %w", err)
+	}
+	if hasConstraint {
+		if c.verboseMode {
+			log.Log.Debugf(c.ctx, "primary key constraint already exists on table %s, updating to new primary keys", tableName)
+		}
+		// Use UpdatePrimaryKeyConstraints to modify existing constraint
+		return c.UpdatePrimaryKeyConstraints(tableName, primaryKeyColumns)
+	}
+
+	// Build ALTER TABLE statement to add primary key constraint with multiple columns
+	// Note: BigQuery doesn't support named primary key constraints
+	escapedColumns := make([]string, len(primaryKeyColumns))
+	for i, col := range primaryKeyColumns {
+		escapedColumns[i] = escapeIdentifier(col)
+	}
+
+	alterQuery := fmt.Sprintf(`
+		ALTER TABLE %s.%s.%s
+		ADD PRIMARY KEY (%s) NOT ENFORCED
+	`, c.projectID, c.datasetID, tableName, strings.Join(escapedColumns, ", "))
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "setting primary key constraints on table %s: %s", tableName, alterQuery)
+	}
+
+	// Execute ALTER TABLE statement
+	err = c.ExecuteDML(c.ctx, alterQuery)
+	if err != nil {
+		return fmt.Errorf("failed to set primary key constraints: %w", err)
+	}
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "successfully set primary key constraints on table %s", tableName)
+	}
+
+	return nil
+}
+
+// UpdatePrimaryKeyConstraints updates primary key constraints on an existing BigQuery table
+func (c *Client) UpdatePrimaryKeyConstraints(tableName string, primaryKeyColumns []string) error {
+	if tableName == "" {
+		return fmt.Errorf("table name cannot be empty")
+	}
+	if len(primaryKeyColumns) == 0 {
+		return fmt.Errorf("primary key columns cannot be empty")
+	}
+
+	// Check if primary key constraint exists
+	hasConstraint, err := c.HasPrimaryKeyConstraint(tableName)
+	if err != nil {
+		return fmt.Errorf("could not check if primary key constraint exists: %w", err)
+	}
+
+	// Build ALTER TABLE statement to modify primary key constraint
+	escapedColumns := make([]string, len(primaryKeyColumns))
+	for i, col := range primaryKeyColumns {
+		escapedColumns[i] = escapeIdentifier(col)
+	}
+
+	var alterQuery string
+	if hasConstraint {
+		// Get current primary key columns to compare
+		currentPrimaryKeys, err := c.GetPrimaryKeyColumns(tableName)
+		if err != nil {
+			return fmt.Errorf("could not get current primary key columns: %w", err)
+		}
+
+		// Only drop and recreate if the primary keys don't match
+		if !comparePrimaryKeyColumns(currentPrimaryKeys, primaryKeyColumns) {
+			if c.verboseMode {
+				log.Log.Debugf(c.ctx, "primary key columns don't match (current: %v, desired: %v), updating", currentPrimaryKeys, primaryKeyColumns)
+			}
+			// Drop existing primary key constraint first, then add new one
+			alterQuery = fmt.Sprintf(`
+				ALTER TABLE %s.%s.%s
+				DROP PRIMARY KEY;
+				
+				ALTER TABLE %s.%s.%s
+				ADD PRIMARY KEY (%s) NOT ENFORCED
+			`, c.projectID, c.datasetID, tableName,
+				c.projectID, c.datasetID, tableName, strings.Join(escapedColumns, ", "))
+		} else {
+			if c.verboseMode {
+				log.Log.Debugf(c.ctx, "primary key columns already match (current: %v), no update needed", currentPrimaryKeys)
+			}
+			return nil // No update needed
+		}
+	} else {
+		// Just add the primary key constraint
+		alterQuery = fmt.Sprintf(`
+			ALTER TABLE %s.%s.%s
+			ADD PRIMARY KEY (%s) NOT ENFORCED
+		`, c.projectID, c.datasetID, tableName, strings.Join(escapedColumns, ", "))
+	}
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "updating primary key constraints on table %s: %s", tableName, alterQuery)
+	}
+
+	// Execute ALTER TABLE statement(s)
+	err = c.ExecuteDML(c.ctx, alterQuery)
+	if err != nil {
+		return fmt.Errorf("failed to update primary key constraints: %w", err)
+	}
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "successfully updated primary key constraints on table %s", tableName)
+	}
+
+	return nil
+}
+
+// GetPrimaryKeyColumns gets the current primary key columns from a BigQuery table
+func (c *Client) GetPrimaryKeyColumns(tableName string) ([]string, error) {
+	if tableName == "" {
+		return nil, fmt.Errorf("table name cannot be empty")
+	}
+
+	// Query INFORMATION_SCHEMA to get primary key columns
+	query := fmt.Sprintf(`
+		SELECT column_name
+		FROM %s.%s.INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+		WHERE table_name = '%s' AND constraint_name IN (
+			SELECT constraint_name
+			FROM %s.%s.INFORMATION_SCHEMA.TABLE_CONSTRAINTS
+			WHERE table_name = '%s' AND constraint_type = 'PRIMARY KEY'
+		)
+		ORDER BY ordinal_position
+	`, c.projectID, c.datasetID, tableName, c.projectID, c.datasetID, tableName)
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "getting primary key columns: %s", query)
+	}
+
+	it, err := c.ExecuteQuery(c.ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get primary key columns: %w", err)
+	}
+
+	var primaryKeyColumns []string
+	for {
+		var result struct {
+			ColumnName string `bigquery:"column_name"`
+		}
+		err := it.Next(&result)
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to read primary key column: %w", err)
+		}
+		primaryKeyColumns = append(primaryKeyColumns, result.ColumnName)
+	}
+
+	return primaryKeyColumns, nil
+}
+
+// comparePrimaryKeyColumns compares two slices of primary key column names
+func comparePrimaryKeyColumns(current, desired []string) bool {
+	if len(current) != len(desired) {
+		return false
+	}
+
+	for i, col := range current {
+		if col != desired[i] {
+			return false
+		}
+	}
+
+	return true
 }
 
 // HasPrimaryKeyConstraint checks if a table has a primary key constraint
@@ -511,28 +704,19 @@ func (c *Client) AddClusteringToTable(table *Table, opts ...func(*clusteringOpts
 		opt(&clusteringOpts)
 	}
 
-	// Ensure primary key is set from table columns
-	if table.PrimaryKeyName == "" {
-		table.PrimaryKeyName = c.detectPrimaryKeyFromColumns(table)
-	}
-
-	// Check if table exists
-	exists, err := c.IsTableExistent(table)
-	if err != nil {
-		return fmt.Errorf("could not check if table exists: %w", err)
-	}
-	if !exists {
-		return fmt.Errorf("table %s does not exist", table.Name)
+	// Ensure primary keys are set from table columns
+	if len(table.PrimaryKeyNames) == 0 {
+		table.PrimaryKeyNames = c.detectPrimaryKeysFromColumns(table)
 	}
 
 	// Determine clustering fields
 	var clusteringFields []string
 	if len(clusteringOpts.clusteringFields) > 0 {
 		clusteringFields = clusteringOpts.clusteringFields
-	} else if table.PrimaryKeyName != "" {
-		clusteringFields = []string{table.PrimaryKeyName}
+	} else if len(table.PrimaryKeyNames) > 0 {
+		clusteringFields = table.PrimaryKeyNames
 	} else {
-		return fmt.Errorf("no clustering fields specified and no primary key found for table %s", table.Name)
+		return fmt.Errorf("no clustering fields specified and no primary keys found for table %s", table.Name)
 	}
 
 	// Check if clustering already exists
@@ -671,9 +855,7 @@ func (c *Client) needsTableRecreation(table *Table) (bool, error) {
 	// Check if any current columns are missing in the new schema (column removal)
 	for colName := range *currentTable.Columns {
 		if _, exists := (*table.Columns)[colName]; !exists {
-			if c.verboseMode {
-				log.Log.Debugf(c.ctx, "column %s exists in current table but not in new schema - recreation needed", colName)
-			}
+			log.Log.Infof(c.ctx, "column %s exists in table %s but not in new schema - recreation needed", colName, table.Name)
 			return true, nil
 		}
 	}
@@ -681,17 +863,13 @@ func (c *Client) needsTableRecreation(table *Table) (bool, error) {
 	// Check if any existing columns have type changes
 	for colName, newCol := range *table.Columns {
 		if currentCol, exists := (*currentTable.Columns)[colName]; exists {
-			if currentCol.Type != newCol.Type {
-				if c.verboseMode {
-					log.Log.Debugf(c.ctx, "column %s type changed from %s to %s - recreation needed", colName, currentCol.Type, newCol.Type)
-				}
+			if normalizeBigQueryType(currentCol.Type) != normalizeBigQueryType(newCol.Type) {
+				log.Log.Infof(c.ctx, "column %s type in table %s changed from %s to %s - recreation needed", colName, table.Name, currentCol.Type, newCol.Type)
 				return true, nil
 			}
 			// Check mode changes that require recreation (e.g., REQUIRED to NULLABLE)
 			if currentCol.Mode != newCol.Mode {
-				if c.verboseMode {
-					log.Log.Debugf(c.ctx, "column %s mode changed from %s to %s - recreation needed", colName, currentCol.Mode, newCol.Mode)
-				}
+				log.Log.Infof(c.ctx, "column %s mode in table %s changed from %s to %s - recreation needed", colName, table.Name, currentCol.Mode, newCol.Mode)
 				return true, nil
 			}
 		}
@@ -710,9 +888,9 @@ func (c *Client) AlterTableAddColumns(table *Table) error {
 		return fmt.Errorf("unable to alter table: table cannot be nil")
 	}
 
-	// Ensure primary key is set from table columns
-	if table.PrimaryKeyName == "" {
-		table.PrimaryKeyName = c.detectPrimaryKeyFromColumns(table)
+	// Ensure primary keys are set from table columns
+	if len(table.PrimaryKeyNames) == 0 {
+		table.PrimaryKeyNames = c.detectPrimaryKeysFromColumns(table)
 	}
 
 	// Get current schema
@@ -784,7 +962,7 @@ func (c *Client) AlterTableAddColumns(table *Table) error {
 	return nil
 }
 
-// UpsertRows upserts rows into a BigQuery table using a MERGE statement
+// UpsertRows upserts rows into a BigQuery table using a MERGE statement with retry logic
 func (c *Client) UpsertRows(rows ...Row) error {
 	if len(rows) == 0 {
 		return fmt.Errorf("no rows to upsert")
@@ -795,6 +973,74 @@ func (c *Client) UpsertRows(rows ...Row) error {
 			return fmt.Errorf("row cannot be nil")
 		}
 
+		err := c.upsertRowWithRetry(row)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// GetPrimaryKeyValues extracts the primary key values from a Row as a map
+func (c *Client) GetPrimaryKeyValues(row Row) map[string]interface{} {
+	table := row.Table()
+	cols := row.Columns()
+	pkValues := make(map[string]interface{})
+
+	// Get primary key column names
+	var primaryKeys []string
+	if len(table.PrimaryKeyNames) > 0 {
+		primaryKeys = table.PrimaryKeyNames
+	} else {
+		// Fallback: look for a column named "id" (common convention)
+		if _, exists := (*cols)["id"]; exists {
+			primaryKeys = []string{"id"}
+		} else {
+			// Last resort: use all REQUIRED columns
+			for colName, col := range *cols {
+				if col.Mode == "REQUIRED" {
+					primaryKeys = append(primaryKeys, colName)
+				}
+			}
+		}
+	}
+
+	// Extract values for each primary key
+	for _, pkName := range primaryKeys {
+		if col, exists := (*cols)[pkName]; exists {
+			pkValues[pkName] = col.Value
+		}
+	}
+
+	return pkValues
+}
+
+// GetPrimaryKeyValuesString returns primary key values as a formatted string for logging
+func (c *Client) GetPrimaryKeyValuesString(row Row) string {
+	pkValues := c.GetPrimaryKeyValues(row)
+	if len(pkValues) == 0 {
+		return "no-pk"
+	}
+
+	var parts []string
+	for pkName, pkValue := range pkValues {
+		parts = append(parts, fmt.Sprintf("%s=%v", pkName, pkValue))
+	}
+
+	return fmt.Sprintf("{%s}", strings.Join(parts, ", "))
+}
+
+// upsertRowWithRetry performs a single row upsert with exponential backoff retry logic
+func (c *Client) upsertRowWithRetry(row Row) error {
+	maxRetries := c.maxRetries
+	if maxRetries <= 0 {
+		maxRetries = 3 // Default fallback
+	}
+
+	var lastErr error
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		table := row.Table()
 
 		// Build MERGE statement for upsert
@@ -809,12 +1055,36 @@ func (c *Client) UpsertRows(rows ...Row) error {
 
 		// Execute MERGE statement
 		err = c.ExecuteDML(c.ctx, mergeQuery)
-		if err != nil {
+		if err == nil {
+			return nil // Success
+		}
+
+		lastErr = err
+
+		// Check if this is a concurrency error that we should retry
+		if strings.Contains(err.Error(), "concurrent update") ||
+			strings.Contains(err.Error(), "Could not serialize access") {
+
+			if attempt < maxRetries {
+				// Exponential backoff: 100ms, 200ms, 400ms, 800ms, etc.
+				backoffDuration := time.Duration(100*(1<<attempt)) * time.Millisecond
+				log.Log.Warnf(c.ctx, "concurrent update error, retrying in %v (attempt %d/%d), pk columns: %v, pk values: %v",
+					backoffDuration, attempt+1, maxRetries+1, row.Table().PrimaryKeyNames, c.GetPrimaryKeyValuesString(row))
+
+				select {
+				case <-c.ctx.Done():
+					return c.ctx.Err()
+				case <-time.After(backoffDuration):
+					continue
+				}
+			}
+		} else {
+			// Non-retryable error, return immediately
 			return fmt.Errorf("failed to upsert row in table %s: %w, query: %s", table.Name, err, mergeQuery)
 		}
 	}
 
-	return nil
+	return fmt.Errorf("failed to upsert row after %d retries: %w", maxRetries+1, lastErr)
 }
 
 // buildMergeQuery builds a MERGE statement for upserting a row
@@ -822,29 +1092,28 @@ func (c *Client) buildMergeQuery(row Row) (string, error) {
 	table := row.Table()
 	cols := row.Columns()
 
-	// Find primary key column
-	var primaryKey string
+	// Find primary key columns
+	var primaryKeys []string
 
-	// First try to use the table's PrimaryKeyName if available
-	if table.PrimaryKeyName != "" {
-		primaryKey = table.PrimaryKeyName
+	// First try to use the table's PrimaryKeyNames if available
+	if len(table.PrimaryKeyNames) > 0 {
+		primaryKeys = table.PrimaryKeyNames
 	} else {
 		// Fallback: look for a column named "id" (common convention)
 		if _, exists := (*cols)["id"]; exists {
-			primaryKey = "id"
+			primaryKeys = []string{"id"}
 		} else {
-			// Last resort: use the first REQUIRED column
+			// Last resort: use all REQUIRED columns
 			for colName, col := range *cols {
 				if col.Mode == "REQUIRED" {
-					primaryKey = colName
-					break
+					primaryKeys = append(primaryKeys, colName)
 				}
 			}
 		}
 	}
 
-	if primaryKey == "" {
-		return "", fmt.Errorf("no primary key found for upsert operation")
+	if len(primaryKeys) == 0 {
+		return "", fmt.Errorf("no primary keys found for upsert operation")
 	}
 
 	// Build column lists
@@ -852,6 +1121,7 @@ func (c *Client) buildMergeQuery(row Row) (string, error) {
 	var insertValues []string
 	var updateSet []string
 	var sourceSelect []string
+	var onConditions []string
 
 	for colName, col := range *cols {
 		// Format value for SQL
@@ -863,10 +1133,22 @@ func (c *Client) buildMergeQuery(row Row) (string, error) {
 		// Build source SELECT clause: value AS column_name
 		sourceSelect = append(sourceSelect, fmt.Sprintf("%s AS %s", formattedValue, escapeIdentifier(colName)))
 
-		// For UPDATE SET, exclude the primary key
-		if colName != primaryKey {
+		// For UPDATE SET, exclude primary key columns
+		isPrimaryKey := false
+		for _, pk := range primaryKeys {
+			if colName == pk {
+				isPrimaryKey = true
+				break
+			}
+		}
+		if !isPrimaryKey {
 			updateSet = append(updateSet, fmt.Sprintf("%s = %s", escapeIdentifier(colName), formattedValue))
 		}
+	}
+
+	// Build ON conditions for multiple primary keys
+	for _, pk := range primaryKeys {
+		onConditions = append(onConditions, fmt.Sprintf("target.%s = source.%s", escapeIdentifier(pk), escapeIdentifier(pk)))
 	}
 
 	// Build the MERGE statement
@@ -875,7 +1157,7 @@ func (c *Client) buildMergeQuery(row Row) (string, error) {
 		USING (
 			SELECT %s
 		) AS source
-		ON target.%s = source.%s
+		ON %s
 		WHEN MATCHED THEN
 			UPDATE SET %s
 		WHEN NOT MATCHED THEN
@@ -883,15 +1165,15 @@ func (c *Client) buildMergeQuery(row Row) (string, error) {
 			VALUES (%s)`,
 		c.projectID, c.datasetID, table.Name,
 		strings.Join(sourceSelect, ", "),
-		escapeIdentifier(primaryKey), escapeIdentifier(primaryKey),
+		strings.Join(onConditions, " AND "),
 		strings.Join(updateSet, ", "),
 		strings.Join(insertColumns, ", "),
 		strings.Join(insertValues, ", "))
 
 	// Debug logging
 	if c.verboseMode {
-		log.Log.Debugf(c.ctx, "MERGE query components - PrimaryKey: %s, SourceSelect: %v, InsertColumns: %v, InsertValues: %v, UpdateSet: %v",
-			primaryKey, sourceSelect, insertColumns, insertValues, updateSet)
+		log.Log.Debugf(c.ctx, "MERGE query components - PrimaryKeys: %v, SourceSelect: %v, InsertColumns: %v, InsertValues: %v, UpdateSet: %v",
+			primaryKeys, sourceSelect, insertColumns, insertValues, updateSet)
 	}
 
 	return mergeQuery, nil
@@ -925,7 +1207,8 @@ func (c *Client) formatValueForSQL(value interface{}, colType bigqueryType) stri
 			}
 			// Return as PARSE_JSON for JSON type
 			jsonStr := string(jsonBytes)
-			escaped := strings.ReplaceAll(jsonStr, "'", "\\'")
+			escaped := strings.ReplaceAll(jsonStr, "\\", "\\\\") // Escape backslashes first
+			escaped = strings.ReplaceAll(escaped, "'", "\\'")
 			return fmt.Sprintf("PARSE_JSON('%s')", escaped)
 		}
 
@@ -956,7 +1239,8 @@ func (c *Client) formatValueForSQL(value interface{}, colType bigqueryType) stri
 			if err != nil {
 				// Fallback to string representation if JSON marshaling fails
 				str := fmt.Sprintf("%v", value)
-				escaped := strings.ReplaceAll(str, "'", "\\'")
+				escaped := strings.ReplaceAll(str, "\\", "\\\\") // Escape backslashes first
+				escaped = strings.ReplaceAll(escaped, "'", "\\'")
 				escaped = strings.ReplaceAll(escaped, "\n", "\\n")
 				escaped = strings.ReplaceAll(escaped, "\r", "\\r")
 				escaped = strings.ReplaceAll(escaped, "\t", "\\t")
@@ -964,7 +1248,8 @@ func (c *Client) formatValueForSQL(value interface{}, colType bigqueryType) stri
 			}
 			// Wrap JSON in quotes and cast to JSON type for BigQuery MERGE
 			jsonStr := string(jsonBytes)
-			escaped := strings.ReplaceAll(jsonStr, "'", "\\'")
+			escaped := strings.ReplaceAll(jsonStr, "\\", "\\\\") // Escape backslashes first
+			escaped = strings.ReplaceAll(escaped, "'", "\\'")
 			escaped = strings.ReplaceAll(escaped, "\n", "\\n")
 			escaped = strings.ReplaceAll(escaped, "\r", "\\r")
 			escaped = strings.ReplaceAll(escaped, "\t", "\\t")
@@ -1018,24 +1303,6 @@ func (c *Client) DeleteRows(rows ...Row) error {
 
 		table := row.Table()
 
-		// Check if table exists
-		exists, err := c.IsTableExistent(table)
-		if err != nil {
-			return fmt.Errorf("failed to delete: could not check if table %s exists: %w", table.Name, err)
-		}
-		if !exists {
-			return fmt.Errorf("failed to delete: table %s does not exist", table.Name)
-		}
-
-		// Check if schema is aligned
-		aligned, err := c.IsSchemaAligned(table)
-		if err != nil {
-			return fmt.Errorf("failed to delete: could not check if schema is aligned: %w", err)
-		}
-		if !aligned {
-			return fmt.Errorf("failed to delete: schema is not aligned")
-		}
-
 		// Build DELETE query
 		cols := row.Columns()
 		colNames := utils.GetKeysFromMap(*cols)
@@ -1069,7 +1336,7 @@ func (c *Client) DeleteRows(rows ...Row) error {
 		}
 
 		// Execute DELETE query with parameters
-		_, err = c.QueryWithParams(query, params)
+		_, err := c.QueryWithParams(query, params)
 		if err != nil {
 			return fmt.Errorf("failed to delete row (%s) in table (%s): %w", strings.Join(colNames, ", "), table.Name, err)
 		}
@@ -1242,14 +1509,14 @@ func (c *Client) SelectRows(tableName string, opts ...func(*selectRowsOpts)) (*b
 		opt(&selectOpts)
 	}
 
-	// Check if table exists
-	exists, err := c.IsTableExistent(&Table{Name: tableName})
-	if err != nil {
-		return nil, fmt.Errorf("failed to check if table exists: %w", err)
-	}
-	if !exists {
-		return nil, fmt.Errorf("table %s does not exist", tableName)
-	}
+	// // Check if table exists
+	// exists, err := c.IsTableExistent(&Table{Name: tableName})
+	// if err != nil {
+	// 	return nil, fmt.Errorf("failed to check if table exists: %w", err)
+	// }
+	// if !exists {
+	// 	return nil, fmt.Errorf("table %s does not exist", tableName)
+	// }
 
 	// Build SELECT query
 	columnsClause := strings.Join(selectOpts.columns, ", ")
@@ -1315,25 +1582,6 @@ func (c *Client) LeftJoin(leftTable *Table, rightTable *Table, joinColumns []Joi
 	for _, pair := range joinColumns {
 		if pair.LeftColumnName == "" || pair.RightColumnName == "" {
 			return nil, nil, fmt.Errorf("unable to left join: join column pair names cannot be empty")
-		}
-	}
-
-	// Check if tables exist and schema align
-	for _, t := range []*Table{leftTable, rightTable} {
-		exists, err := c.IsTableExistent(t)
-		if err != nil {
-			return nil, nil, fmt.Errorf("could not check if table %s exists: %w", t.Name, err)
-		}
-		if !exists {
-			return nil, nil, fmt.Errorf("table %s does not exist", t.Name)
-		}
-
-		aligned, err := c.IsSchemaAligned(t)
-		if err != nil {
-			return nil, nil, fmt.Errorf("could not check if schema is aligned: %w", err)
-		}
-		if !aligned {
-			return nil, nil, fmt.Errorf("schema is not aligned for table %s", t.Name)
 		}
 	}
 

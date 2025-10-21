@@ -35,11 +35,11 @@ type Row interface {
 
 // Table represents a BigQuery table
 type Table struct {
-	Name           string
-	Columns        *map[string]Column
-	PrimaryKeyName string
-	Description    string
-	Labels         map[string]string
+	Name            string
+	Columns         *map[string]Column
+	PrimaryKeyNames []string // Multiple primary keys supported
+	Description     string
+	Labels          map[string]string
 }
 
 // Column represents a BigQuery column
@@ -49,6 +49,12 @@ type Column struct {
 	Mode        string // NULLABLE, REQUIRED, REPEATED
 	Description string
 	Value       interface{}
+}
+
+type Metadata struct {
+	UpdatedAt     time.Time `json:"updated_at"`
+	SchemaVersion string    `json:"schema_version"`
+	SchemaDate    time.Time `json:"schema_date"`
 }
 
 // JoinColumnPair represents columns used in joins
@@ -270,3 +276,42 @@ const (
 )
 
 type bigqueryType string
+
+func (m *Metadata) GetSchemaVersion() string {
+	return m.SchemaVersion
+}
+
+func (m *Metadata) GetSchemaDate() time.Time {
+	return m.SchemaDate
+}
+
+func (m *Metadata) GetUpdatedAt() time.Time {
+	return m.UpdatedAt
+}
+
+func (m *Metadata) SetMetadata(opts ...func(*Metadata)) {
+	m.UpdatedAt = time.Now()
+	m.SchemaDate = time.Date(2025, 10, 1, 0, 0, 0, 0, time.UTC)
+	m.SchemaVersion = "1.0.0"
+	for _, opt := range opts {
+		opt(m)
+	}
+}
+
+func WithSchemaVersion(schemaVersion string) func(*Metadata) {
+	return func(m *Metadata) {
+		m.SchemaVersion = schemaVersion
+	}
+}
+
+func WithSchemaDate(schemaDate time.Time) func(*Metadata) {
+	return func(m *Metadata) {
+		m.SchemaDate = schemaDate
+	}
+}
+
+func WithUpdatedAt(updatedAt time.Time) func(*Metadata) {
+	return func(m *Metadata) {
+		m.UpdatedAt = updatedAt
+	}
+}

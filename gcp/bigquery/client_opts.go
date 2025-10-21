@@ -50,6 +50,17 @@ func WithMaxRetries(maxRetries int) clientOpt {
 	}
 }
 
+// WithRetryConfig provides convenient retry configuration options
+func WithRetryConfig(maxRetries int) clientOpt {
+	return func(c *Client) error {
+		if maxRetries < 0 {
+			return fmt.Errorf("maxRetries must be non-negative, got %d", maxRetries)
+		}
+		c.maxRetries = maxRetries
+		return nil
+	}
+}
+
 func WithUseLegacySQL(useLegacySQL bool) clientOpt {
 	return func(c *Client) error {
 		c.useLegacySQL = useLegacySQL

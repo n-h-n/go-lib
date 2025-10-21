@@ -564,3 +564,7 @@ func LevenshteinSimilarity(s1, s2 string) float64 {
 
 	return similarity
 }
+
+func RemoveElementByIndex[T any](slice []T, index int) []T {
+	return append(slice[:index], slice[index+1:]...)
+}
