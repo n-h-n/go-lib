@@ -14,8 +14,10 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -23,6 +25,7 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"go.mongodb.org/mongo-driver/bson"
 	"golang.org/x/exp/slices"
+	"golang.org/x/net/publicsuffix"
 
 	"github.com/agnivade/levenshtein"
 
@@ -567,4 +570,108 @@ func LevenshteinSimilarity(s1, s2 string) float64 {
 
 func RemoveElementByIndex[T any](slice []T, index int) []T {
 	return append(slice[:index], slice[index+1:]...)
+}
+
+// ExtractTopLevelDomain extracts the effective top-level domain (eTLD+1) from a website URL.
+// It properly handles public suffixes like .ac.jp, .co.uk, etc.
+// Examples:
+//   - "http://www.nifs.ac.jp" -> "nifs.ac.jp"
+//   - "http://english.cas.cn/" -> "cas.cn"
+//   - "https://example.com" -> "example.com"
+//
+// Returns an empty string if the URL cannot be parsed or the domain cannot be extracted.
+func ExtractTopLevelDomain(websiteURL string) string {
+	if websiteURL == "" {
+		return ""
+	}
+
+	var hostname string
+
+	// Try parsing as URL first
+	parsedURL, err := url.Parse(websiteURL)
+	if err == nil && parsedURL.Host != "" {
+		hostname = parsedURL.Host
+	} else {
+		// If parsing failed or no host, try to extract hostname manually
+		// Remove common prefixes
+		hostname = strings.TrimPrefix(websiteURL, "http://")
+		hostname = strings.TrimPrefix(hostname, "https://")
+		// Remove path and query
+		if idx := strings.IndexAny(hostname, "/?#"); idx != -1 {
+			hostname = hostname[:idx]
+		}
+	}
+
+	// Remove port if present
+	if idx := strings.Index(hostname, ":"); idx != -1 {
+		hostname = hostname[:idx]
+	}
+
+	// Trim whitespace
+	hostname = strings.TrimSpace(hostname)
+	if hostname == "" {
+		return ""
+	}
+
+	// Use publicsuffix to get the effective top-level domain + 1 label (eTLD+1)
+	// This properly handles cases like .ac.jp, .co.uk, etc.
+	domain, err := publicsuffix.EffectiveTLDPlusOne(hostname)
+	if err != nil {
+		// If publicsuffix fails, fall back to a simple extraction
+		parts := strings.Split(hostname, ".")
+		if len(parts) >= 2 {
+			// Take last two parts as a simple fallback
+			return strings.Join(parts[len(parts)-2:], ".")
+		}
+		return hostname
+	}
+
+	return domain
+}
+
+// BuildQueryString builds a query string from a map of parameters.
+// It handles slices by adding multiple query params with the same key,
+// and properly URL encodes all values.
+func BuildQueryString(params map[string]interface{}) string {
+	if len(params) == 0 {
+		return ""
+	}
+
+	values := url.Values{}
+	for key, value := range params {
+		switch v := value.(type) {
+		case []string:
+			// Handle slice parameters by adding multiple query params
+			for _, item := range v {
+				values.Add(key, item)
+			}
+		case string:
+			if v != "" {
+				values.Add(key, v)
+			}
+		case int:
+			if v > 0 {
+				values.Add(key, strconv.Itoa(v))
+			}
+		case int64:
+			if v > 0 {
+				values.Add(key, strconv.FormatInt(v, 10))
+			}
+		case bool:
+			if v {
+				values.Add(key, "true")
+			}
+		default:
+			// Handle other types by converting to string
+			if v != nil {
+				values.Add(key, fmt.Sprintf("%v", v))
+			}
+		}
+	}
+
+	queryString := values.Encode()
+	if queryString != "" {
+		return "?" + queryString
+	}
+	return ""
 }

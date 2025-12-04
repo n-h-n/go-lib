@@ -1,10 +1,12 @@
 package bigquery
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/bigquery"
@@ -1205,11 +1207,11 @@ func (c *Client) formatValueForSQL(value interface{}, colType bigqueryType) stri
 				}
 				return fmt.Sprintf("[%s]", strings.Join(elements, ", "))
 			}
-			// Return as PARSE_JSON for JSON type
+			// Return as PARSE_JSON for JSON type with wide_number_mode to handle float precision
 			jsonStr := string(jsonBytes)
 			escaped := strings.ReplaceAll(jsonStr, "\\", "\\\\") // Escape backslashes first
 			escaped = strings.ReplaceAll(escaped, "'", "\\'")
-			return fmt.Sprintf("PARSE_JSON('%s')", escaped)
+			return fmt.Sprintf("PARSE_JSON('%s', wide_number_mode=>'round')", escaped)
 		}
 
 		// For REPEATED fields, format each element individually
@@ -1247,13 +1249,12 @@ func (c *Client) formatValueForSQL(value interface{}, colType bigqueryType) stri
 				return fmt.Sprintf("'%s'", escaped)
 			}
 			// Wrap JSON in quotes and cast to JSON type for BigQuery MERGE
+			// Use wide_number_mode to handle float precision issues
 			jsonStr := string(jsonBytes)
-			escaped := strings.ReplaceAll(jsonStr, "\\", "\\\\") // Escape backslashes first
+			// Properly escape for SQL: escape backslashes first, then single quotes
+			escaped := strings.ReplaceAll(jsonStr, "\\", "\\\\")
 			escaped = strings.ReplaceAll(escaped, "'", "\\'")
-			escaped = strings.ReplaceAll(escaped, "\n", "\\n")
-			escaped = strings.ReplaceAll(escaped, "\r", "\\r")
-			escaped = strings.ReplaceAll(escaped, "\t", "\\t")
-			return fmt.Sprintf("PARSE_JSON('%s')", escaped)
+			return fmt.Sprintf("PARSE_JSON('%s', wide_number_mode=>'round')", escaped)
 		}
 		// For non-struct values, treat as string
 		str := fmt.Sprintf("%v", value)
@@ -1270,6 +1271,16 @@ func (c *Client) formatValueForSQL(value interface{}, colType bigqueryType) stri
 		return fmt.Sprintf("%t", value)
 	case TypeTimestamp:
 		if t, ok := value.(time.Time); ok {
+			if t.IsZero() {
+				return "NULL"
+			}
+			return fmt.Sprintf("TIMESTAMP('%s')", t.Format(time.RFC3339))
+		}
+		// Check if this is a struct that embeds time.Time (e.g., UnixTime)
+		if t, ok := extractTimeFromStruct(value); ok {
+			if t.IsZero() {
+				return "NULL"
+			}
 			return fmt.Sprintf("TIMESTAMP('%s')", t.Format(time.RFC3339))
 		}
 		return fmt.Sprintf("TIMESTAMP('%v')", value)
@@ -2502,4 +2513,68 @@ func convertToBigQuerySchemaFields(schema *Schema) []*bigquery.FieldSchema {
 	}
 
 	return fields
+}
+
+// WriteRowsToBigQuery is a generic function that writes rows to BigQuery with concurrency control and progress tracking.
+// T must implement the bigquery.Row interface.
+// logStartMsg and logResultMsg are functions that generate log messages for each row.
+func WriteRowsToBigQuery[T Row](
+	ctx context.Context,
+	bigqueryClient *Client,
+	rows []T,
+	logStartMsg func(row T, percentage float64) string,
+	logResultMsg func(row T, percentage float64, isError bool) string,
+) error {
+	// Create a semaphore to limit concurrent DML operations to 2
+	semaphore := make(chan struct{}, 2)
+
+	// Use atomic counter to track completed items
+	var completed int64
+	total := int64(len(rows))
+
+	// Use channels to collect results from goroutines
+	type result struct {
+		index int
+		err   error
+	}
+
+	resultChan := make(chan result, len(rows))
+
+	// Process each row in a separate goroutine with concurrency limit
+	for idx, row := range rows {
+		go func(index int, r T) {
+			// Acquire semaphore
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }() // Release semaphore
+
+			// Calculate percentage before processing
+			currentCompleted := atomic.AddInt64(&completed, 0)
+			percentage := float64(currentCompleted) / float64(total) * 100
+			log.Log.Infof(ctx, logStartMsg(r, percentage))
+
+			r.SetMetadata()
+			err := bigqueryClient.UpsertRows(r) // Now has built-in retry logic
+
+			// Increment completed counter and log completion
+			newCompleted := atomic.AddInt64(&completed, 1)
+			newPercentage := float64(newCompleted) / float64(total) * 100
+
+			if err != nil {
+				log.Log.Errorf(ctx, logResultMsg(r, newPercentage, true))
+			} else {
+				log.Log.Infof(ctx, logResultMsg(r, newPercentage, false))
+			}
+			resultChan <- result{index: index, err: err}
+		}(idx, row)
+	}
+
+	// Collect results and check for errors
+	for i := 0; i < len(rows); i++ {
+		res := <-resultChan
+		if res.err != nil {
+			return res.err
+		}
+	}
+
+	return nil
 }

@@ -1,6 +1,7 @@
 package bigquery
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/bigquery"
+	"github.com/n-h-n/go-lib/log"
 )
 
 // normalizeBigQueryType normalizes BigQuery type names for comparison
@@ -39,6 +41,54 @@ func hasJSONTags(t reflect.Type) bool {
 		}
 	}
 	return false
+}
+
+// embedsTime checks if a struct embeds time.Time through an anonymous field
+// This handles wrapper types like UnixTime that embed time.Time for custom unmarshaling
+func embedsTime(t reflect.Type) bool {
+	if t.Kind() != reflect.Struct {
+		return false
+	}
+
+	timeType := reflect.TypeOf(time.Time{})
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		// Check if this is an anonymous embedded field that is time.Time
+		if field.Anonymous && field.Type == timeType {
+			return true
+		}
+	}
+	return false
+}
+
+// extractTimeFromStruct extracts time.Time from a struct that embeds time.Time
+// Returns the time.Time value and true if found, otherwise returns zero time and false
+func extractTimeFromStruct(v interface{}) (time.Time, bool) {
+	val := reflect.ValueOf(v)
+	if val.Kind() == reflect.Ptr {
+		if val.IsNil() {
+			return time.Time{}, false
+		}
+		val = val.Elem()
+	}
+	if val.Kind() != reflect.Struct {
+		return time.Time{}, false
+	}
+
+	timeType := reflect.TypeOf(time.Time{})
+	for i := 0; i < val.NumField(); i++ {
+		field := val.Field(i)
+		fieldType := val.Type().Field(i)
+		// Check if this is an anonymous embedded field that is time.Time
+		if fieldType.Anonymous && fieldType.Type == timeType {
+			if field.CanInterface() {
+				if t, ok := field.Interface().(time.Time); ok {
+					return t, true
+				}
+			}
+		}
+	}
+	return time.Time{}, false
 }
 
 // deserializeJSONToStruct attempts to deserialize JSON data into a struct with JSON tags
@@ -481,6 +531,10 @@ func goTypeToBigQueryType(t reflect.Type) (bigqueryType, error) {
 		if t == reflect.TypeOf(time.Time{}) {
 			return TypeTimestamp, nil
 		}
+		// Check if struct embeds time.Time (e.g., UnixTime wrapper types)
+		if embedsTime(t) {
+			return TypeTimestamp, nil
+		}
 		// Check if struct has JSON tags - if so, treat as JSON
 		if hasJSONTags(t) {
 			return TypeJSON, nil
@@ -835,6 +889,10 @@ func validateDatasetName(datasetName string) error {
 
 // formatBigQueryValue formats a value for BigQuery SQL
 func formatBigQueryValue(value interface{}) string {
+	if value == nil {
+		return "NULL"
+	}
+
 	switch v := value.(type) {
 	case string:
 		return fmt.Sprintf("'%s'", strings.ReplaceAll(v, "'", "\\'"))
@@ -847,10 +905,82 @@ func formatBigQueryValue(value interface{}) string {
 	case bool:
 		return fmt.Sprintf("%t", v)
 	case time.Time:
+		if v.IsZero() {
+			return "NULL"
+		}
 		return fmt.Sprintf("TIMESTAMP('%s')", v.Format(time.RFC3339))
-	case nil:
-		return "NULL"
 	default:
+		// Check if this is a struct that embeds time.Time (e.g., UnixTime)
+		if t, ok := extractTimeFromStruct(v); ok {
+			if t.IsZero() {
+				return "NULL"
+			}
+			return fmt.Sprintf("TIMESTAMP('%s')", t.Format(time.RFC3339))
+		}
 		return fmt.Sprintf("'%v'", v)
 	}
+}
+
+func BigQueryStartup(ctx context.Context, client *Client, tables []*Table) error {
+	log.Log.Infof(ctx, "ensuring BQ tables exist...")
+
+	// Use channels to collect results from goroutines
+	type result struct {
+		tableName string
+		err       error
+	}
+
+	resultChan := make(chan result, len(tables))
+
+	// Process each table in a separate goroutine
+	for _, table := range tables {
+		go func(t *Table) {
+			tableName := t.Name
+			log.Log.Infof(ctx, "starting BigQuery setup for table: %s", tableName)
+
+			// Create table
+			err := client.CreateTable(t)
+			if err != nil {
+				log.Log.Errorf(ctx, "failed to create BigQuery table %s: %v", tableName, err)
+				resultChan <- result{tableName: tableName, err: err}
+				return
+			}
+
+			// Align table schema
+			err = client.AlignTableSchema(t, WithAlignTableRecreation(false))
+			if err != nil {
+				log.Log.Errorf(ctx, "failed to align BigQuery table schema for %s: %v", tableName, err)
+				resultChan <- result{tableName: tableName, err: err}
+				return
+			}
+
+			// Ensure clustering indices are created
+			err = client.AddClusteringToTable(t, WithForceRecreateClustering(false))
+			if err != nil {
+				log.Log.Errorf(ctx, "failed to create BigQuery clustering indices for %s: %v", tableName, err)
+				resultChan <- result{tableName: tableName, err: err}
+				return
+			}
+
+			// Success - send nil error
+			resultChan <- result{tableName: tableName, err: nil}
+		}(table)
+	}
+
+	// Collect results and check for errors
+	var errors []error
+	for i := 0; i < len(tables); i++ {
+		res := <-resultChan
+		if res.err != nil {
+			errors = append(errors, fmt.Errorf("table %s: %w", res.tableName, res.err))
+		}
+	}
+
+	// Return combined error if any occurred
+	if len(errors) > 0 {
+		return fmt.Errorf("failed to create BigQuery tables: %w", errors[0])
+	}
+
+	log.Log.Infof(ctx, "all BigQuery tables setup completed successfully")
+	return nil
 }
