@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -674,4 +675,363 @@ func BuildQueryString(params map[string]interface{}) string {
 		return "?" + queryString
 	}
 	return ""
+}
+
+// RateLimiter interface that both local and Redis limiters implement
+type RateLimiter interface {
+	Allow(ctx context.Context) bool
+	Wait(ctx context.Context) error
+	WaitN(ctx context.Context, n int) error
+	Close() error
+}
+
+// AdaptiveRateLimiter extends RateLimiter with synchronization methods for adaptive rate limiting
+type AdaptiveRateLimiter interface {
+	RateLimiter
+	SyncFromHeaders(rateLimitInfo *RateLimitInfo) error
+	GetCurrentState() *RateLimitState
+}
+
+// RateLimitState represents the current state of the rate limiter
+type RateLimitState struct {
+	RequestsLimit     int           `json:"requests_limit"`
+	RequestsRemaining int           `json:"requests_remaining"`
+	RetryAfter        time.Duration `json:"retry_after"`
+	LastSync          time.Time     `json:"last_sync"`
+}
+
+// RateLimitInfo contains rate limiting information from API responses
+type RateLimitInfo struct {
+	RetryAfter        int `json:"retry_after"`
+	RequestsLimit     int `json:"requests_limit"`
+	RequestsRemaining int `json:"requests_remaining"`
+}
+
+// Wrapper types to adapt the different limiter interfaces
+type redisLimiterWrapper struct {
+	limiter  interface{}
+	state    *RateLimitState
+	lastSync time.Time
+	mu       sync.RWMutex
+}
+
+func (w *redisLimiterWrapper) Allow(ctx context.Context) bool {
+	// Use reflection or type assertion to call Allow
+	// Both rlim.Limiter and llim.Limiter have Allow(ctx context.Context) bool
+	if l, ok := w.limiter.(interface{ Allow(context.Context) bool }); ok {
+		return l.Allow(ctx)
+	}
+	return false
+}
+
+func (w *redisLimiterWrapper) Wait(ctx context.Context) error {
+	// Call Wait with no options - both limiters support variadic opts
+	if l, ok := w.limiter.(interface{ Wait(context.Context, ...interface{}) error }); ok {
+		return l.Wait(ctx)
+	}
+	// Fallback: try calling with empty variadic args using reflection
+	return w.callWait(ctx)
+}
+
+func (w *redisLimiterWrapper) WaitN(ctx context.Context, n int) error {
+	if l, ok := w.limiter.(interface{ WaitN(context.Context, int, ...interface{}) error }); ok {
+		return l.WaitN(ctx, n)
+	}
+	return w.callWaitN(ctx, n)
+}
+
+func (w *redisLimiterWrapper) callWait(ctx context.Context) error {
+	// Use reflection to call Wait with empty variadic args
+	method := reflect.ValueOf(w.limiter).MethodByName("Wait")
+	if !method.IsValid() {
+		return fmt.Errorf("limiter does not have Wait method")
+	}
+	args := []reflect.Value{reflect.ValueOf(ctx)}
+	result := method.Call(args)
+	if len(result) > 0 && !result[0].IsNil() {
+		return result[0].Interface().(error)
+	}
+	return nil
+}
+
+func (w *redisLimiterWrapper) callWaitN(ctx context.Context, n int) error {
+	method := reflect.ValueOf(w.limiter).MethodByName("WaitN")
+	if !method.IsValid() {
+		return fmt.Errorf("limiter does not have WaitN method")
+	}
+	args := []reflect.Value{reflect.ValueOf(ctx), reflect.ValueOf(n)}
+	result := method.Call(args)
+	if len(result) > 0 && !result[0].IsNil() {
+		return result[0].Interface().(error)
+	}
+	return nil
+}
+
+func (w *redisLimiterWrapper) Close() error {
+	return nil
+}
+
+func (w *redisLimiterWrapper) SyncFromHeaders(rateLimitInfo *RateLimitInfo) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.state == nil {
+		w.state = &RateLimitState{}
+	}
+
+	w.state.RequestsLimit = rateLimitInfo.RequestsLimit
+	w.state.RequestsRemaining = rateLimitInfo.RequestsRemaining
+	w.state.RetryAfter = time.Duration(rateLimitInfo.RetryAfter) * time.Second
+	w.state.LastSync = time.Now()
+	w.lastSync = time.Now()
+
+	return nil
+}
+
+func (w *redisLimiterWrapper) GetCurrentState() *RateLimitState {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	if w.state == nil {
+		return &RateLimitState{}
+	}
+
+	// Return a copy to avoid race conditions
+	return &RateLimitState{
+		RequestsLimit:     w.state.RequestsLimit,
+		RequestsRemaining: w.state.RequestsRemaining,
+		RetryAfter:        w.state.RetryAfter,
+		LastSync:          w.state.LastSync,
+	}
+}
+
+type localLimiterWrapper struct {
+	limiter  interface{}
+	state    *RateLimitState
+	lastSync time.Time
+	mu       sync.RWMutex
+	// Adaptive rate limiting state
+	adaptiveMode bool
+}
+
+func (w *localLimiterWrapper) Allow(ctx context.Context) bool {
+	if l, ok := w.limiter.(interface{ Allow(context.Context) bool }); ok {
+		return l.Allow(ctx)
+	}
+	return false
+}
+
+func (w *localLimiterWrapper) Wait(ctx context.Context) error {
+	if l, ok := w.limiter.(interface{ Wait(context.Context, ...interface{}) error }); ok {
+		return l.Wait(ctx)
+	}
+	return w.callWait(ctx)
+}
+
+func (w *localLimiterWrapper) WaitN(ctx context.Context, n int) error {
+	if l, ok := w.limiter.(interface{ WaitN(context.Context, int, ...interface{}) error }); ok {
+		return l.WaitN(ctx, n)
+	}
+	return w.callWaitN(ctx, n)
+}
+
+func (w *localLimiterWrapper) callWait(ctx context.Context) error {
+	method := reflect.ValueOf(w.limiter).MethodByName("Wait")
+	if !method.IsValid() {
+		return fmt.Errorf("limiter does not have Wait method")
+	}
+	args := []reflect.Value{reflect.ValueOf(ctx)}
+	result := method.Call(args)
+	if len(result) > 0 && !result[0].IsNil() {
+		return result[0].Interface().(error)
+	}
+	return nil
+}
+
+func (w *localLimiterWrapper) callWaitN(ctx context.Context, n int) error {
+	method := reflect.ValueOf(w.limiter).MethodByName("WaitN")
+	if !method.IsValid() {
+		return fmt.Errorf("limiter does not have WaitN method")
+	}
+	args := []reflect.Value{reflect.ValueOf(ctx), reflect.ValueOf(n)}
+	result := method.Call(args)
+	if len(result) > 0 && !result[0].IsNil() {
+		return result[0].Interface().(error)
+	}
+	return nil
+}
+
+func (w *localLimiterWrapper) Close() error {
+	return nil
+}
+
+func (w *localLimiterWrapper) SyncFromHeaders(rateLimitInfo *RateLimitInfo) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.state == nil {
+		w.state = &RateLimitState{}
+	}
+
+	w.state.RequestsLimit = rateLimitInfo.RequestsLimit
+	w.state.RequestsRemaining = rateLimitInfo.RequestsRemaining
+	w.state.RetryAfter = time.Duration(rateLimitInfo.RetryAfter) * time.Second
+	w.state.LastSync = time.Now()
+	w.lastSync = time.Now()
+
+	// Enable adaptive mode if we have valid rate limit info
+	if rateLimitInfo.RequestsLimit > 0 {
+		w.adaptiveMode = true
+	}
+
+	return nil
+}
+
+func (w *localLimiterWrapper) GetCurrentState() *RateLimitState {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	if w.state == nil {
+		return &RateLimitState{}
+	}
+
+	// Return a copy to avoid race conditions
+	return &RateLimitState{
+		RequestsLimit:     w.state.RequestsLimit,
+		RequestsRemaining: w.state.RequestsRemaining,
+		RetryAfter:        w.state.RetryAfter,
+		LastSync:          w.state.LastSync,
+	}
+}
+
+
+// Simple wrapper types without adaptive features
+type simpleRedisLimiterWrapper struct {
+	limiter interface{}
+}
+
+func (w *simpleRedisLimiterWrapper) Allow(ctx context.Context) bool {
+	if l, ok := w.limiter.(interface{ Allow(context.Context) bool }); ok {
+		return l.Allow(ctx)
+	}
+	return false
+}
+
+func (w *simpleRedisLimiterWrapper) Wait(ctx context.Context) error {
+	if l, ok := w.limiter.(interface{ Wait(context.Context, ...interface{}) error }); ok {
+		return l.Wait(ctx)
+	}
+	return w.callWait(ctx)
+}
+
+func (w *simpleRedisLimiterWrapper) WaitN(ctx context.Context, n int) error {
+	if l, ok := w.limiter.(interface{ WaitN(context.Context, int, ...interface{}) error }); ok {
+		return l.WaitN(ctx, n)
+	}
+	return w.callWaitN(ctx, n)
+}
+
+func (w *simpleRedisLimiterWrapper) callWait(ctx context.Context) error {
+	method := reflect.ValueOf(w.limiter).MethodByName("Wait")
+	if !method.IsValid() {
+		return fmt.Errorf("limiter does not have Wait method")
+	}
+	args := []reflect.Value{reflect.ValueOf(ctx)}
+	result := method.Call(args)
+	if len(result) > 0 && !result[0].IsNil() {
+		return result[0].Interface().(error)
+	}
+	return nil
+}
+
+func (w *simpleRedisLimiterWrapper) callWaitN(ctx context.Context, n int) error {
+	method := reflect.ValueOf(w.limiter).MethodByName("WaitN")
+	if !method.IsValid() {
+		return fmt.Errorf("limiter does not have WaitN method")
+	}
+	args := []reflect.Value{reflect.ValueOf(ctx), reflect.ValueOf(n)}
+	result := method.Call(args)
+	if len(result) > 0 && !result[0].IsNil() {
+		return result[0].Interface().(error)
+	}
+	return nil
+}
+
+func (w *simpleRedisLimiterWrapper) Close() error {
+	return nil
+}
+
+type simpleLocalLimiterWrapper struct {
+	limiter interface{}
+}
+
+func (w *simpleLocalLimiterWrapper) Allow(ctx context.Context) bool {
+	if l, ok := w.limiter.(interface{ Allow(context.Context) bool }); ok {
+		return l.Allow(ctx)
+	}
+	return false
+}
+
+func (w *simpleLocalLimiterWrapper) Wait(ctx context.Context) error {
+	if l, ok := w.limiter.(interface{ Wait(context.Context, ...interface{}) error }); ok {
+		return l.Wait(ctx)
+	}
+	return w.callWait(ctx)
+}
+
+func (w *simpleLocalLimiterWrapper) WaitN(ctx context.Context, n int) error {
+	if l, ok := w.limiter.(interface{ WaitN(context.Context, int, ...interface{}) error }); ok {
+		return l.WaitN(ctx, n)
+	}
+	return w.callWaitN(ctx, n)
+}
+
+func (w *simpleLocalLimiterWrapper) callWait(ctx context.Context) error {
+	method := reflect.ValueOf(w.limiter).MethodByName("Wait")
+	if !method.IsValid() {
+		return fmt.Errorf("limiter does not have Wait method")
+	}
+	args := []reflect.Value{reflect.ValueOf(ctx)}
+	result := method.Call(args)
+	if len(result) > 0 && !result[0].IsNil() {
+		return result[0].Interface().(error)
+	}
+	return nil
+}
+
+func (w *simpleLocalLimiterWrapper) callWaitN(ctx context.Context, n int) error {
+	method := reflect.ValueOf(w.limiter).MethodByName("WaitN")
+	if !method.IsValid() {
+		return fmt.Errorf("limiter does not have WaitN method")
+	}
+	args := []reflect.Value{reflect.ValueOf(ctx), reflect.ValueOf(n)}
+	result := method.Call(args)
+	if len(result) > 0 && !result[0].IsNil() {
+		return result[0].Interface().(error)
+	}
+	return nil
+}
+
+func (w *simpleLocalLimiterWrapper) Close() error {
+	return nil
+}
+
+// NewRedisRateLimiterWrapper creates a Redis rate limiter wrapper.
+// The limiter parameter should be rlim.Limiter.
+// If adaptive is true, returns an AdaptiveRateLimiter.
+func NewRedisRateLimiterWrapper(limiter interface{}, adaptive bool) RateLimiter {
+	if adaptive {
+		return &redisLimiterWrapper{limiter: limiter}
+	}
+	return &simpleRedisLimiterWrapper{limiter: limiter}
+}
+
+// NewLocalRateLimiterWrapper creates a local rate limiter wrapper.
+// The limiter parameter should be llim.Limiter.
+// If adaptive is true, returns an AdaptiveRateLimiter.
+func NewLocalRateLimiterWrapper(limiter interface{}, adaptive bool) RateLimiter {
+	if adaptive {
+		return &localLimiterWrapper{limiter: limiter}
+	}
+	return &simpleLocalLimiterWrapper{limiter: limiter}
 }
