@@ -400,12 +400,12 @@ func (c *Client) ZUnionStore(ctx context.Context, dest string, store *redis.ZSto
 func (c *Client) RandomTestingSet() error {
 	id := uuid.New().String()
 
-	status, err := c.Set(c.ctx, "hermes:test", id, 2*time.Minute).Result()
+	status, err := c.Set(c.ctx, "test", id, 2*time.Minute).Result()
 	if err != nil {
 		return err
 	}
 
-	log.Log.Debugf(c.ctx, "successfully set hermes:test to %v: %v", id, status)
+	log.Log.Debugf(c.ctx, "successfully set test to %v: %v", id, status)
 
 	return nil
 }
