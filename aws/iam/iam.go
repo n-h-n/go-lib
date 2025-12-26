@@ -21,20 +21,22 @@ const (
 )
 
 type iamClient struct {
-	assumedRole       *sts.AssumeRoleOutput
-	awsConfig         *aws.Config
-	awsEnvConfig      *config.EnvConfig
-	refreshPercentage float64
-	serviceName       string
-	sessionDuration   time.Duration
-	sessionName       string
-	verboseMode       bool
-	tokenUpdateTime   time.Time
+	assumedRole         *sts.AssumeRoleOutput
+	awsConfig           *aws.Config
+	awsEnvConfig        *config.EnvConfig
+	originalCredentials aws.Credentials
+	refreshPercentage   float64
+	serviceName         string
+	sessionDuration     time.Duration
+	sessionName         string
+	verboseMode         bool
+	tokenUpdateTime     time.Time
 }
 
 type IAMClient interface {
 	GetAssumedRole() *sts.AssumeRoleOutput
 	GetAWSConfig() *aws.Config
+	GetOriginalCredentials() aws.Credentials
 	GetAWSRegion() string
 	GetRefreshPercentage() float64
 	GetRoleARN() string
@@ -65,6 +67,13 @@ func NewIAMClient(
 	if err := c.loadDefaultConfig(ctx); err != nil {
 		return nil, err
 	}
+
+	// Store original credentials before assuming role (needed for ElastiCache IAM auth)
+	originalCreds, err := c.awsConfig.Credentials.Retrieve(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve original AWS credentials: %w", err)
+	}
+	c.originalCredentials = originalCreds
 
 	if err := c.assumeRole(ctx); err != nil {
 		return nil, err
@@ -173,6 +182,14 @@ func (c *iamClient) RefreshAWSCreds(ctx context.Context, opts ...func(*RefreshOp
 		return err
 	}
 
+	// Refresh original credentials (pod identity credentials are managed by pod identity agent)
+	// These are needed for ElastiCache IAM auth which requires credentials matching the ElastiCache user
+	originalCreds, err := c.awsConfig.Credentials.Retrieve(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve original AWS credentials: %w", err)
+	}
+	c.originalCredentials = originalCreds
+
 	if err := c.assumeRole(ctx); err != nil {
 		return err
 	}
@@ -190,6 +207,10 @@ func (c *iamClient) GetAssumedRole() *sts.AssumeRoleOutput {
 
 func (c *iamClient) GetAWSConfig() *aws.Config {
 	return c.awsConfig
+}
+
+func (c *iamClient) GetOriginalCredentials() aws.Credentials {
+	return c.originalCredentials
 }
 
 func (c *iamClient) GetAWSRegion() string {

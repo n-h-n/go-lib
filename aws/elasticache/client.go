@@ -8,7 +8,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
@@ -83,10 +82,13 @@ func (c *Client) newDefaultRedisClient(redisURI string) (redis.UniversalClient, 
 
 func (c *Client) newDefaultRedisClusterClient(redisURI []string) (redis.UniversalClient, error) {
 	token, err := c.generateIAMAuthToken()
-	c.token = token
 	if err != nil {
 		return nil, err
 	}
+	c.token = token
+	log.Log.Infof(c.ctx, "generated username: %v", c.iamClient.GetServiceName())
+	log.Log.Infof(c.ctx, "generated IAM auth token: %v", token)
+	log.Log.Infof(c.ctx, "generated redis URI: %v", redisURI)
 	redisClient := redis.NewClusterClient(&redis.ClusterOptions{
 		Addrs:     redisURI,
 		Username:  c.iamClient.GetServiceName(),
@@ -192,11 +194,14 @@ func (c *Client) generateIAMAuthToken() (string, error) {
 		region:             c.iamClient.GetAWSRegion(),
 	}
 
-	return tokenRequest.toSignedRequestURI(aws.Credentials{
-		AccessKeyID:     *c.iamClient.GetAssumedRole().Credentials.AccessKeyId,
-		SecretAccessKey: *c.iamClient.GetAssumedRole().Credentials.SecretAccessKey,
-		SessionToken:    *c.iamClient.GetAssumedRole().Credentials.SessionToken,
-	})
+	// Use original credentials (pod identity) for ElastiCache IAM auth
+	// ElastiCache IAM authentication requires credentials that match the ElastiCache user
+	// When a role assumes itself, the assumed role credentials don't map correctly to ElastiCache users
+	// The original credentials are refreshed alongside the assumed role credentials in RefreshAWSCreds
+	// See: https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/auth-iam.html
+	creds := c.iamClient.GetOriginalCredentials()
+
+	return tokenRequest.toSignedRequestURI(creds)
 }
 
 func (c *Client) writeTokenToLocalFile() error {
