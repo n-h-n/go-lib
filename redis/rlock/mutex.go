@@ -184,6 +184,10 @@ func (m *mutex) Lock(ctx context.Context) error {
 				break
 			}
 
+			if m.verbose {
+				log.Log.Debugf(ctx, "acquired lock: %s, app ID: %s, lock type: %s, ttl: %v", m.key, m.appID, m.lockType, ttl)
+			}
+
 			close(done)
 			break
 		}
@@ -211,6 +215,10 @@ func (m *mutex) Unlock(ctx context.Context) error {
 			log.Log.Errorf(ctx, "error while unlocking: %v", err)
 			return err
 		}
+	}
+
+	if m.verbose {
+		log.Log.Debugf(ctx, "unlocked lock: %s, app ID: %s, lock type: %s, unlock type: %s", m.key, m.appID, m.lockType, m.unlockType)
 	}
 
 	return nil

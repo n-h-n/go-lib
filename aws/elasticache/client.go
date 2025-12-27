@@ -86,9 +86,6 @@ func (c *Client) newDefaultRedisClusterClient(redisURI []string) (redis.Universa
 		return nil, err
 	}
 	c.token = token
-	log.Log.Infof(c.ctx, "generated username: %v", c.iamClient.GetServiceName())
-	log.Log.Infof(c.ctx, "generated IAM auth token: %v", token)
-	log.Log.Infof(c.ctx, "generated redis URI: %v", redisURI)
 	redisClient := redis.NewClusterClient(&redis.ClusterOptions{
 		Addrs:     redisURI,
 		Username:  c.iamClient.GetServiceName(),
