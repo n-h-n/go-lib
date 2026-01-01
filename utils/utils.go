@@ -29,8 +29,11 @@ import (
 	"golang.org/x/net/publicsuffix"
 
 	"github.com/agnivade/levenshtein"
+	"github.com/redis/go-redis/v9"
 
+	"github.com/n-h-n/go-lib/aws/elasticache"
 	"github.com/n-h-n/go-lib/log"
+	"github.com/n-h-n/go-lib/redis/rlock"
 )
 
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
@@ -726,7 +729,9 @@ func (w *redisLimiterWrapper) Allow(ctx context.Context) bool {
 
 func (w *redisLimiterWrapper) Wait(ctx context.Context) error {
 	// Call Wait with no options - both limiters support variadic opts
-	if l, ok := w.limiter.(interface{ Wait(context.Context, ...interface{}) error }); ok {
+	if l, ok := w.limiter.(interface {
+		Wait(context.Context, ...interface{}) error
+	}); ok {
 		return l.Wait(ctx)
 	}
 	// Fallback: try calling with empty variadic args using reflection
@@ -734,7 +739,9 @@ func (w *redisLimiterWrapper) Wait(ctx context.Context) error {
 }
 
 func (w *redisLimiterWrapper) WaitN(ctx context.Context, n int) error {
-	if l, ok := w.limiter.(interface{ WaitN(context.Context, int, ...interface{}) error }); ok {
+	if l, ok := w.limiter.(interface {
+		WaitN(context.Context, int, ...interface{}) error
+	}); ok {
 		return l.WaitN(ctx, n)
 	}
 	return w.callWaitN(ctx, n)
@@ -822,14 +829,18 @@ func (w *localLimiterWrapper) Allow(ctx context.Context) bool {
 }
 
 func (w *localLimiterWrapper) Wait(ctx context.Context) error {
-	if l, ok := w.limiter.(interface{ Wait(context.Context, ...interface{}) error }); ok {
+	if l, ok := w.limiter.(interface {
+		Wait(context.Context, ...interface{}) error
+	}); ok {
 		return l.Wait(ctx)
 	}
 	return w.callWait(ctx)
 }
 
 func (w *localLimiterWrapper) WaitN(ctx context.Context, n int) error {
-	if l, ok := w.limiter.(interface{ WaitN(context.Context, int, ...interface{}) error }); ok {
+	if l, ok := w.limiter.(interface {
+		WaitN(context.Context, int, ...interface{}) error
+	}); ok {
 		return l.WaitN(ctx, n)
 	}
 	return w.callWaitN(ctx, n)
@@ -904,7 +915,6 @@ func (w *localLimiterWrapper) GetCurrentState() *RateLimitState {
 	}
 }
 
-
 // Simple wrapper types without adaptive features
 type simpleRedisLimiterWrapper struct {
 	limiter interface{}
@@ -918,14 +928,18 @@ func (w *simpleRedisLimiterWrapper) Allow(ctx context.Context) bool {
 }
 
 func (w *simpleRedisLimiterWrapper) Wait(ctx context.Context) error {
-	if l, ok := w.limiter.(interface{ Wait(context.Context, ...interface{}) error }); ok {
+	if l, ok := w.limiter.(interface {
+		Wait(context.Context, ...interface{}) error
+	}); ok {
 		return l.Wait(ctx)
 	}
 	return w.callWait(ctx)
 }
 
 func (w *simpleRedisLimiterWrapper) WaitN(ctx context.Context, n int) error {
-	if l, ok := w.limiter.(interface{ WaitN(context.Context, int, ...interface{}) error }); ok {
+	if l, ok := w.limiter.(interface {
+		WaitN(context.Context, int, ...interface{}) error
+	}); ok {
 		return l.WaitN(ctx, n)
 	}
 	return w.callWaitN(ctx, n)
@@ -973,14 +987,18 @@ func (w *simpleLocalLimiterWrapper) Allow(ctx context.Context) bool {
 }
 
 func (w *simpleLocalLimiterWrapper) Wait(ctx context.Context) error {
-	if l, ok := w.limiter.(interface{ Wait(context.Context, ...interface{}) error }); ok {
+	if l, ok := w.limiter.(interface {
+		Wait(context.Context, ...interface{}) error
+	}); ok {
 		return l.Wait(ctx)
 	}
 	return w.callWait(ctx)
 }
 
 func (w *simpleLocalLimiterWrapper) WaitN(ctx context.Context, n int) error {
-	if l, ok := w.limiter.(interface{ WaitN(context.Context, int, ...interface{}) error }); ok {
+	if l, ok := w.limiter.(interface {
+		WaitN(context.Context, int, ...interface{}) error
+	}); ok {
 		return l.WaitN(ctx, n)
 	}
 	return w.callWaitN(ctx, n)
@@ -1034,4 +1052,70 @@ func NewLocalRateLimiterWrapper(limiter interface{}, adaptive bool) RateLimiter 
 		return &localLimiterWrapper{limiter: limiter}
 	}
 	return &simpleLocalLimiterWrapper{limiter: limiter}
+}
+
+// DistributedLock interface for distributed locking (local or Redis-based)
+type DistributedLock interface {
+	Lock(ctx context.Context) error
+	Unlock(ctx context.Context) error
+}
+
+// localLockWrapper is a no-op lock implementation for local development
+type localLockWrapper struct{}
+
+func (l *localLockWrapper) Lock(ctx context.Context) error {
+	return nil
+}
+
+func (l *localLockWrapper) Unlock(ctx context.Context) error {
+	return nil
+}
+
+// redisLockWrapper wraps rlock.Mutex for Redis-based distributed locking
+type redisLockWrapper struct {
+	mtx rlock.Mutex
+}
+
+func (l *redisLockWrapper) Lock(ctx context.Context) error {
+	return l.mtx.Lock(ctx)
+}
+
+func (l *redisLockWrapper) Unlock(ctx context.Context) error {
+	return l.mtx.Unlock(ctx)
+}
+
+// NewDistributedLock creates a distributed lock based on available resources.
+// It accepts an elasticache client, a Redis client, keyspace, appID, verboseMode,
+// and optional rlock.MutexOpt options.
+// If neither elasticache nor Redis client is available, returns a local no-op lock.
+func NewDistributedLock(
+	elasticacheClient *elasticache.Client,
+	redisClient redis.UniversalClient,
+	keyspace string,
+	appID string,
+	verboseMode bool,
+	opts ...rlock.MutexOpt,
+) DistributedLock {
+	var client redis.UniversalClient
+
+	// Use Redis-based locking if elasticache client is available
+	if elasticacheClient != nil {
+		client = elasticacheClient.GetRedisClient()
+	} else if redisClient != nil {
+		// Fall back to Redis client if available
+		client = redisClient
+	}
+
+	// If we have a Redis client, create a Redis-based lock
+	if client != nil {
+		rlockOpts := append([]rlock.MutexOpt{rlock.WithWait(false)}, opts...)
+		if verboseMode {
+			rlockOpts = append(rlockOpts, rlock.WithVerbose())
+		}
+		mtx := rlock.NewMutex(client, keyspace, appID, rlockOpts...)
+		return &redisLockWrapper{mtx: mtx}
+	}
+
+	// Use local no-op lock for development
+	return &localLockWrapper{}
 }
