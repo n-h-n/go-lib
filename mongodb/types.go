@@ -1,0 +1,120 @@
+package mongodb
+
+import (
+	"os"
+	"time"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+)
+
+type SortDirection int
+type EqualityOperator string
+type EqualityFilter struct {
+	FieldName string
+	Value     float64
+	Operator  EqualityOperator
+}
+
+const (
+	SortDirectionAsc                   SortDirection    = 1
+	SortDirectionDesc                  SortDirection    = -1
+	EqualityOperatorEqual              EqualityOperator = "$eq"
+	EqualityOperatorNotEqual           EqualityOperator = "$ne"
+	EqualityOperatorGreaterThanOrEqual EqualityOperator = "$gte"
+	EqualityOperatorLessThanOrEqual    EqualityOperator = "$lte"
+)
+
+// Document is an interface for all documents which can be written to a collection.
+type Document interface {
+	Collection() Collection
+
+	CollectionName() string
+
+	Database() Database
+
+	DatabaseName() string
+
+	TimestampField() string
+
+	GetID() string
+
+	SetMetadata()
+}
+
+type Collection string
+type Database string
+
+type SearchIndexModel struct {
+	SearchIndex mongo.SearchIndexModel
+	Reindex     bool
+}
+
+// String returns the string representation of the collection type, i.e. the collection name.
+func (c Collection) String() string {
+	return string(c)
+}
+
+// String returns the string representation of the database type, i.e. the database name.
+func (d Database) String() string {
+	return string(d)
+}
+
+type Metadata struct {
+	SchemaVersion  int       `bson:"schema_version" json:"schema_version"`
+	InstanceID     string    `bson:"instance_id" json:"instance_id"`
+	UpdatedAt      time.Time `bson:"updated_at" json:"updated_at"`
+	AthenaLastSync time.Time `bson:"athena_last_sync" json:"athena_last_sync"`
+}
+
+func (r *Metadata) Set(ver int) {
+	r.SchemaVersion = ver
+	r.InstanceID = os.Getenv("HOSTNAME")
+	r.UpdatedAt = time.Now()
+}
+
+type SearchOptions struct {
+	Limit         int
+	NumCandidates int
+	Exact         bool
+	Sort          bson.D
+	ScoreCutoff   *EqualityFilter
+}
+
+type SearchOption func(*SearchOptions)
+
+func WithLimit(limit int) SearchOption {
+	return func(opts *SearchOptions) {
+		opts.Limit = limit
+	}
+}
+
+func WithNumCandidates(numCandidates int) SearchOption {
+	return func(opts *SearchOptions) {
+		opts.NumCandidates = numCandidates
+	}
+}
+
+func WithExact(exact bool) SearchOption {
+	return func(opts *SearchOptions) {
+		opts.Exact = exact
+	}
+}
+
+func WithScoreCutoff(scoreField string, scoreCutoff float64, op EqualityOperator) SearchOption {
+	return func(opts *SearchOptions) {
+		opts.ScoreCutoff = &EqualityFilter{
+			FieldName: scoreField,
+			Value:     scoreCutoff,
+			Operator:  op,
+		}
+	}
+}
+
+func WithSort(sortSpec ...bson.E) SearchOption {
+	return func(opts *SearchOptions) {
+		for _, spec := range sortSpec {
+			opts.Sort = append(opts.Sort, spec)
+		}
+	}
+}
