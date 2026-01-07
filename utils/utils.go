@@ -29,7 +29,6 @@ import (
 	"golang.org/x/net/publicsuffix"
 
 	"github.com/agnivade/levenshtein"
-	"github.com/redis/go-redis/v9"
 
 	"github.com/n-h-n/go-lib/aws/elasticache"
 	"github.com/n-h-n/go-lib/log"
@@ -1085,37 +1084,29 @@ func (l *redisLockWrapper) Unlock(ctx context.Context) error {
 }
 
 // NewDistributedLock creates a distributed lock based on available resources.
-// It accepts an elasticache client, a Redis client, keyspace, appID, verboseMode,
+// It accepts an elasticache client, keyspace, appID, verboseMode,
 // and optional rlock.MutexOpt options.
-// If neither elasticache nor Redis client is available, returns a local no-op lock.
+// If elasticache client is nil or unavailable, returns a local no-op lock.
 func NewDistributedLock(
 	elasticacheClient *elasticache.Client,
-	redisClient redis.UniversalClient,
 	keyspace string,
 	appID string,
 	verboseMode bool,
 	opts ...rlock.MutexOpt,
 ) DistributedLock {
-	var client redis.UniversalClient
-
 	// Use Redis-based locking if elasticache client is available
 	if elasticacheClient != nil {
-		client = elasticacheClient.GetRedisClient()
-	} else if redisClient != nil {
-		// Fall back to Redis client if available
-		client = redisClient
-	}
-
-	// If we have a Redis client, create a Redis-based lock
-	if client != nil {
-		rlockOpts := append([]rlock.MutexOpt{rlock.WithWait(false)}, opts...)
-		if verboseMode {
-			rlockOpts = append(rlockOpts, rlock.WithVerbose())
+		client := elasticacheClient.GetRedisClient()
+		if client != nil {
+			rlockOpts := append([]rlock.MutexOpt{rlock.WithWait(false)}, opts...)
+			if verboseMode {
+				rlockOpts = append(rlockOpts, rlock.WithVerbose())
+			}
+			mtx := rlock.NewMutex(client, keyspace, appID, rlockOpts...)
+			return &redisLockWrapper{mtx: mtx}
 		}
-		mtx := rlock.NewMutex(client, keyspace, appID, rlockOpts...)
-		return &redisLockWrapper{mtx: mtx}
 	}
 
-	// Use local no-op lock for development
+	// Use local no-op lock for development or when Redis is unavailable
 	return &localLockWrapper{}
 }
