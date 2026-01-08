@@ -125,21 +125,6 @@ func PrintPrettyJSON(data map[string]interface{}) {
 	fmt.Println(string(prettyJSON))
 }
 
-func GetDevOrgIDFromString(s string, fullID bool) string {
-	if !fullID {
-		re := regexp.MustCompile(`devo/([^:]+)`)
-		match := re.FindStringSubmatch(s)
-		if len(match) > 1 {
-			return match[1]
-		} else {
-			return ""
-		}
-	} else {
-		p := strings.Split(s, ":devu/")
-		return p[0]
-	}
-}
-
 func IndividualizeSetFields(obj interface{}, fieldsToIgnore []string, customOperators bson.M) (bson.D, error) {
 	keys := bson.D{}
 
