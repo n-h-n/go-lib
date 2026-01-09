@@ -85,3 +85,10 @@ func WithDBName(dbName string) clientOpt {
 		return nil
 	}
 }
+
+func WithPassword(password string) clientOpt {
+	return func(c *Client) error {
+		c.password = password
+		return nil
+	}
+}

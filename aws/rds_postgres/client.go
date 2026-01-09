@@ -24,6 +24,7 @@ type Client struct {
 	dbName          string
 	hostURI         string
 	iamClient       iam.IAMClient
+	password        string // Used for password-based authentication (e.g., GCP Cloud SQL)
 	port            int
 	region          string
 	sslCertFilePath string
@@ -52,64 +53,85 @@ func NewClient(
 		}
 	}
 
-	if c.iamClient == nil {
-		// RDS auth tokens are limited to 15 minutes so set session to 15 minutes
-		iamClient, err := iam.NewIAMClient(ctx, iam.WithVerboseMode(c.verboseMode), iam.WithSessionDuration(15*time.Minute))
+	var authToken string
+	var err error
+
+	// Check if using password-based authentication
+	if c.password != "" {
+		// Password-based authentication (e.g., GCP Cloud SQL)
+		if c.user == "" {
+			return nil, fmt.Errorf("user is required when using password authentication")
+		}
+		if c.dbName == "" {
+			c.dbName = c.user
+		}
+		authToken = c.password
+	} else {
+		// IAM-based authentication (AWS RDS)
+		if c.iamClient == nil {
+			// RDS auth tokens are limited to 15 minutes so set session to 15 minutes
+			iamClient, err := iam.NewIAMClient(ctx, iam.WithVerboseMode(c.verboseMode), iam.WithSessionDuration(15*time.Minute))
+			if err != nil {
+				return nil, err
+			}
+			c.iamClient = iamClient
+		}
+
+		if c.user == "" {
+			c.user = c.iamClient.GetServiceName()
+		}
+
+		if c.region == "" {
+			c.region = c.iamClient.GetAWSRegion()
+		}
+
+		if c.dbName == "" {
+			c.dbName = c.user
+		}
+
+		stsCreds := c.iamClient.GetAssumedRole().Credentials
+		awsCredsProvider := credentials.NewStaticCredentialsProvider(
+			*stsCreds.AccessKeyId,
+			*stsCreds.SecretAccessKey,
+			*stsCreds.SessionToken,
+		)
+		authToken, err = auth.BuildAuthToken(
+			ctx,
+			fmt.Sprintf("%s:%d", c.hostURI, c.port),
+			c.region,
+			c.user,
+			awsCredsProvider,
+		)
 		if err != nil {
 			return nil, err
 		}
-		c.iamClient = iamClient
-	}
-
-	if c.user == "" {
-		c.user = c.iamClient.GetServiceName()
-	}
-
-	if c.region == "" {
-		c.region = c.iamClient.GetAWSRegion()
-	}
-
-	if c.dbName == "" {
-		c.dbName = c.user
-	}
-
-	stsCreds := c.iamClient.GetAssumedRole().Credentials
-	awsCredsProvider := credentials.NewStaticCredentialsProvider(
-		*stsCreds.AccessKeyId,
-		*stsCreds.SecretAccessKey,
-		*stsCreds.SessionToken,
-	)
-	authToken, err := auth.BuildAuthToken(
-		ctx,
-		fmt.Sprintf("%s:%d", c.hostURI, c.port),
-		c.region,
-		c.user,
-		awsCredsProvider,
-	)
-	if err != nil {
-		return nil, err
 	}
 
 	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s", c.hostURI, c.port, c.user, authToken, c.dbName, c.sslMode)
 
 	if c.sslMode != "disable" {
 		if c.sslCertFilePath == "" {
-			if c.verboseMode {
-				log.Log.Debugf(ctx, "sslMode set to %s but no cert filepath specified; downloading SSL root cert from AWS....", c.sslMode)
+			// Only download AWS cert if region is set (IAM auth) and no cert filepath specified
+			if c.region != "" {
+				if c.verboseMode {
+					log.Log.Debugf(ctx, "sslMode set to %s but no cert filepath specified; downloading SSL root cert from AWS....", c.sslMode)
+				}
+				// download the cert from AWS
+				certFilePath, err := downloadSSLRootCert(c.region)
+				if err != nil {
+					return nil, err
+				}
+				c.sslCertFilePath = certFilePath
 			}
-			// download the cert from AWS
-			certFilePath, err := downloadSSLRootCert(c.region)
-			if err != nil {
-				return nil, err
-			}
-			c.sslCertFilePath = certFilePath
 		}
 
-		dsn += fmt.Sprintf(" sslrootcert=%s", c.sslCertFilePath)
+		if c.sslCertFilePath != "" {
+			dsn += fmt.Sprintf(" sslrootcert=%s", c.sslCertFilePath)
+		}
 	}
 
 	if c.verboseMode {
-		log.Log.Debugf(ctx, "connecting to RDS DB: %s:%d, db=%s, with sslmode=%s and sslCertFilePath=%s", c.hostURI, c.port, c.dbName, c.sslMode, c.sslCertFilePath)
+		log.Log.Debugf(ctx, "connecting to DB: %s:%d, db=%s, with sslmode=%s and sslCertFilePath=%s", c.hostURI, c.port, c.dbName, c.sslMode, c.sslCertFilePath)
 	}
 
 	db, err := sql.Open("postgres", dsn)
@@ -124,10 +146,14 @@ func NewClient(
 
 	c.dbClient = db
 	if c.verboseMode {
-		log.Log.Debugf(ctx, "successfully connected to RDS DB")
+		log.Log.Debugf(ctx, "successfully connected to DB")
 	}
 
-	go c.runPeriodicRefresh()
+	// Only run periodic refresh for IAM-based authentication
+	// Password-based authentication doesn't need token refresh
+	if c.password == "" {
+		go c.runPeriodicRefresh()
+	}
 
 	return &c, nil
 }
@@ -166,6 +192,11 @@ func downloadSSLRootCert(region string) (string, error) {
 }
 
 func (c *Client) refreshDBClient() error {
+	// Skip refresh for password-based authentication
+	if c.password != "" {
+		return nil
+	}
+
 	if c.iamClient.GetSessionTimeRemaining().Seconds() > c.iamClient.GetSessionDuration().Seconds()*c.iamClient.GetRefreshPercentage() {
 		// Greater than the refreshAtPercentageRemaining of the session duration remaining, no need to refresh
 		if c.verboseMode {
