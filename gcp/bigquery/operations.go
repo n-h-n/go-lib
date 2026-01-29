@@ -1714,6 +1714,276 @@ func (c *Client) CreateDataset(datasetID string, opts ...func(*createDatasetOpts
 	return nil
 }
 
+// CopyDatasetTables copies all tables from the source dataset to the destination dataset.
+// This is useful as a workaround for BigQuery's immutable dataset names - you cannot rename
+// a dataset, but you can copy all its tables to a new dataset.
+func (c *Client) CopyDatasetTables(sourceDatasetID, destDatasetID string, opts ...func(*copyDatasetOpts)) error {
+	if sourceDatasetID == "" {
+		return fmt.Errorf("source dataset ID cannot be empty")
+	}
+	if destDatasetID == "" {
+		return fmt.Errorf("destination dataset ID cannot be empty")
+	}
+	if sourceDatasetID == destDatasetID {
+		return fmt.Errorf("source and destination dataset IDs cannot be the same")
+	}
+
+	copyOpts := copyDatasetOpts{
+		overwriteExisting: false,
+		skipExisting:      true,
+		concurrency:       4,
+	}
+
+	for _, opt := range opts {
+		opt(&copyOpts)
+	}
+
+	// Validate source dataset exists
+	sourceDatasetRef := c.client.Dataset(sourceDatasetID)
+	_, err := sourceDatasetRef.Metadata(c.ctx)
+	if err != nil {
+		return fmt.Errorf("source dataset %s does not exist or is not accessible: %w", sourceDatasetID, err)
+	}
+
+	// Create destination dataset if it doesn't exist
+	destDatasetRef := c.client.Dataset(destDatasetID)
+	_, err = destDatasetRef.Metadata(c.ctx)
+	if err != nil {
+		if c.verboseMode {
+			log.Log.Debugf(c.ctx, "destination dataset %s does not exist, creating it", destDatasetID)
+		}
+		err = c.CreateDataset(destDatasetID)
+		if err != nil {
+			return fmt.Errorf("failed to create destination dataset %s: %w", destDatasetID, err)
+		}
+	}
+
+	// List all tables in the source dataset
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "listing tables in source dataset %s", sourceDatasetID)
+	}
+
+	it := sourceDatasetRef.Tables(c.ctx)
+	var tableNames []string
+	for {
+		table, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to list tables in source dataset: %w", err)
+		}
+		tableNames = append(tableNames, table.TableID)
+	}
+
+	if len(tableNames) == 0 {
+		if c.verboseMode {
+			log.Log.Debugf(c.ctx, "no tables found in source dataset %s", sourceDatasetID)
+		}
+		return nil
+	}
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "found %d tables to copy from %s to %s", len(tableNames), sourceDatasetID, destDatasetID)
+	}
+
+	// Use channels to collect results from goroutines
+	type result struct {
+		tableName string
+		err       error
+		skipped   bool
+	}
+
+	resultChan := make(chan result, len(tableNames))
+	semaphore := make(chan struct{}, copyOpts.concurrency)
+
+	// Copy each table concurrently
+	for _, tableName := range tableNames {
+		go func(tblName string) {
+			// Acquire semaphore
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			// Check if table already exists in destination
+			destTableRef := destDatasetRef.Table(tblName)
+			_, err := destTableRef.Metadata(c.ctx)
+			tableExists := (err == nil)
+
+			if tableExists {
+				if copyOpts.skipExisting && !copyOpts.overwriteExisting {
+					if c.verboseMode {
+						log.Log.Debugf(c.ctx, "skipping table %s as it already exists in destination dataset", tblName)
+					}
+					resultChan <- result{tableName: tblName, skipped: true}
+					return
+				}
+				if copyOpts.overwriteExisting {
+					if c.verboseMode {
+						log.Log.Debugf(c.ctx, "overwriting existing table %s in destination dataset", tblName)
+					}
+				}
+			}
+
+			// Get source table reference
+			sourceTableRef := sourceDatasetRef.Table(tblName)
+
+			// Create copier
+			copier := destTableRef.CopierFrom(sourceTableRef)
+			if copyOpts.overwriteExisting {
+				copier.WriteDisposition = bigquery.WriteTruncate
+			} else {
+				copier.WriteDisposition = bigquery.WriteEmpty
+			}
+
+			if c.verboseMode {
+				log.Log.Debugf(c.ctx, "copying table %s from %s to %s", tblName, sourceDatasetID, destDatasetID)
+			}
+
+			// Run copy job
+			job, err := copier.Run(c.ctx)
+			if err != nil {
+				resultChan <- result{tableName: tblName, err: fmt.Errorf("failed to start copy job for table %s: %w", tblName, err)}
+				return
+			}
+
+			// Wait for job to complete
+			status, err := job.Wait(c.ctx)
+			if err != nil {
+				resultChan <- result{tableName: tblName, err: fmt.Errorf("copy job failed for table %s: %w", tblName, err)}
+				return
+			}
+
+			if status.Err() != nil {
+				resultChan <- result{tableName: tblName, err: fmt.Errorf("copy job completed with error for table %s: %w", tblName, status.Err())}
+				return
+			}
+
+			if c.verboseMode {
+				log.Log.Debugf(c.ctx, "successfully copied table %s", tblName)
+			}
+
+			resultChan <- result{tableName: tblName}
+		}(tableName)
+	}
+
+	// Collect results and check for errors
+	var errors []error
+	var copiedCount, skippedCount int
+	for i := 0; i < len(tableNames); i++ {
+		res := <-resultChan
+		if res.err != nil {
+			errors = append(errors, res.err)
+		} else if res.skipped {
+			skippedCount++
+		} else {
+			copiedCount++
+		}
+	}
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "copy dataset completed: %d tables copied, %d tables skipped, %d errors", copiedCount, skippedCount, len(errors))
+	}
+
+	// Return combined error if any occurred
+	if len(errors) > 0 {
+		return fmt.Errorf("failed to copy %d table(s): %v", len(errors), errors)
+	}
+
+	return nil
+}
+
+// CopyTable copies a single table from source to destination.
+// The source and destination can be in different datasets or even different projects.
+func (c *Client) CopyTable(sourceDatasetID, sourceTableName, destDatasetID, destTableName string, opts ...func(*copyTableOpts)) error {
+	if sourceDatasetID == "" {
+		return fmt.Errorf("source dataset ID cannot be empty")
+	}
+	if sourceTableName == "" {
+		return fmt.Errorf("source table name cannot be empty")
+	}
+	if destDatasetID == "" {
+		return fmt.Errorf("destination dataset ID cannot be empty")
+	}
+	if destTableName == "" {
+		destTableName = sourceTableName
+	}
+
+	copyOpts := copyTableOpts{
+		overwrite: false,
+	}
+
+	for _, opt := range opts {
+		opt(&copyOpts)
+	}
+
+	// Get source table reference
+	sourceTableRef := c.client.Dataset(sourceDatasetID).Table(sourceTableName)
+
+	// Verify source table exists
+	_, err := sourceTableRef.Metadata(c.ctx)
+	if err != nil {
+		return fmt.Errorf("source table %s.%s does not exist or is not accessible: %w", sourceDatasetID, sourceTableName, err)
+	}
+
+	// Create destination dataset if it doesn't exist
+	destDatasetRef := c.client.Dataset(destDatasetID)
+	_, err = destDatasetRef.Metadata(c.ctx)
+	if err != nil {
+		if c.verboseMode {
+			log.Log.Debugf(c.ctx, "destination dataset %s does not exist, creating it", destDatasetID)
+		}
+		err = c.CreateDataset(destDatasetID)
+		if err != nil {
+			return fmt.Errorf("failed to create destination dataset %s: %w", destDatasetID, err)
+		}
+	}
+
+	// Get destination table reference
+	destTableRef := destDatasetRef.Table(destTableName)
+
+	// Check if destination table exists
+	_, err = destTableRef.Metadata(c.ctx)
+	destExists := (err == nil)
+
+	if destExists && !copyOpts.overwrite {
+		return fmt.Errorf("destination table %s.%s already exists (use WithCopyTableOverwrite(true) to overwrite)", destDatasetID, destTableName)
+	}
+
+	// Create copier
+	copier := destTableRef.CopierFrom(sourceTableRef)
+	if copyOpts.overwrite {
+		copier.WriteDisposition = bigquery.WriteTruncate
+	} else {
+		copier.WriteDisposition = bigquery.WriteEmpty
+	}
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "copying table %s.%s to %s.%s", sourceDatasetID, sourceTableName, destDatasetID, destTableName)
+	}
+
+	// Run copy job
+	job, err := copier.Run(c.ctx)
+	if err != nil {
+		return fmt.Errorf("failed to start copy job: %w", err)
+	}
+
+	// Wait for job to complete
+	status, err := job.Wait(c.ctx)
+	if err != nil {
+		return fmt.Errorf("copy job failed: %w", err)
+	}
+
+	if status.Err() != nil {
+		return fmt.Errorf("copy job completed with error: %w", status.Err())
+	}
+
+	if c.verboseMode {
+		log.Log.Debugf(c.ctx, "successfully copied table %s.%s to %s.%s", sourceDatasetID, sourceTableName, destDatasetID, destTableName)
+	}
+
+	return nil
+}
+
 // DropDataset drops a BigQuery dataset
 func (c *Client) DropDataset(datasetID string, deleteContents bool) error {
 	if datasetID == "" {
@@ -2318,6 +2588,49 @@ type createDatasetOpts struct {
 	description string
 }
 
+type copyDatasetOpts struct {
+	overwriteExisting bool
+	skipExisting      bool
+	concurrency       int
+}
+
+// WithCopyDatasetOverwrite overwrites existing tables in the destination dataset
+func WithCopyDatasetOverwrite(v bool) func(*copyDatasetOpts) {
+	return func(opts *copyDatasetOpts) {
+		opts.overwriteExisting = v
+		if v {
+			opts.skipExisting = false
+		}
+	}
+}
+
+// WithCopyDatasetSkipExisting skips tables that already exist in the destination (default: true)
+func WithCopyDatasetSkipExisting(v bool) func(*copyDatasetOpts) {
+	return func(opts *copyDatasetOpts) {
+		opts.skipExisting = v
+	}
+}
+
+// WithCopyDatasetConcurrency sets the number of concurrent table copy operations (default: 4)
+func WithCopyDatasetConcurrency(n int) func(*copyDatasetOpts) {
+	return func(opts *copyDatasetOpts) {
+		if n > 0 {
+			opts.concurrency = n
+		}
+	}
+}
+
+type copyTableOpts struct {
+	overwrite bool
+}
+
+// WithCopyTableOverwrite overwrites the destination table if it exists
+func WithCopyTableOverwrite(v bool) func(*copyTableOpts) {
+	return func(opts *copyTableOpts) {
+		opts.overwrite = v
+	}
+}
+
 type clusteringOpts struct {
 	clusteringFields []string
 	forceRecreate    bool
@@ -2513,6 +2826,80 @@ func convertToBigQuerySchemaFields(schema *Schema) []*bigquery.FieldSchema {
 	}
 
 	return fields
+}
+
+// SetupTables ensures all provided tables exist with proper schema, primary keys, and clustering.
+// This is a reusable function that replaces duplicated BigQueryStartup logic across clients.
+func (c *Client) SetupTables(tables []*Table) error {
+	log.Log.Infof(c.ctx, "ensuring BQ tables exist...")
+
+	if len(tables) == 0 {
+		log.Log.Infof(c.ctx, "no tables to setup")
+		return nil
+	}
+
+	// Use channels to collect results from goroutines
+	type result struct {
+		tableName string
+		err       error
+	}
+
+	resultChan := make(chan result, len(tables))
+
+	// Process each table in a separate goroutine
+	for _, table := range tables {
+		go func(t *Table) {
+			tableName := t.Name
+			log.Log.Infof(c.ctx, "starting BigQuery setup for table: %s", tableName)
+
+			// Create table
+			err := c.CreateTable(t)
+			if err != nil {
+				log.Log.Errorf(c.ctx, "failed to create BigQuery table %s: %v", tableName, err)
+				resultChan <- result{tableName: tableName, err: err}
+				return
+			}
+			log.Log.Infof(c.ctx, "BigQuery table %s exists", tableName)
+
+			// Align table schema
+			err = c.AlignTableSchema(t, WithAlignTableRecreation(false))
+			if err != nil {
+				log.Log.Errorf(c.ctx, "failed to align BigQuery table schema for %s: %v", tableName, err)
+				resultChan <- result{tableName: tableName, err: err}
+				return
+			}
+			log.Log.Infof(c.ctx, "BigQuery table schema aligned for %s", tableName)
+
+			// Ensure clustering indices are created
+			err = c.AddClusteringToTable(t, WithForceRecreateClustering(false))
+			if err != nil {
+				log.Log.Errorf(c.ctx, "failed to create BigQuery clustering indices for %s: %v", tableName, err)
+				resultChan <- result{tableName: tableName, err: err}
+				return
+			}
+			log.Log.Infof(c.ctx, "BigQuery clustering indices created for %s", tableName)
+
+			// Success - send nil error
+			resultChan <- result{tableName: tableName, err: nil}
+		}(table)
+	}
+
+	// Collect results and check for errors
+	var errors []error
+	for i := 0; i < len(tables); i++ {
+		res := <-resultChan
+		if res.err != nil {
+			errors = append(errors, fmt.Errorf("table %s: %w", res.tableName, res.err))
+		}
+	}
+
+	// Return combined error if any occurred
+	if len(errors) > 0 {
+		return fmt.Errorf("BigQuery startup failed for %d table(s): %v", len(errors), errors)
+	}
+
+	log.Log.Infof(c.ctx, "all BigQuery tables setup completed successfully")
+	return nil
 }
 
 // WriteRowsToBigQuery is a generic function that writes rows to BigQuery with concurrency control and progress tracking.

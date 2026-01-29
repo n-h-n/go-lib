@@ -12,6 +12,7 @@ import (
 
 	"github.com/n-h-n/go-lib/aws/elasticache"
 	"github.com/n-h-n/go-lib/local/llim"
+	"github.com/n-h-n/go-lib/log"
 	"github.com/n-h-n/go-lib/redis/rlim"
 	"github.com/n-h-n/go-lib/utils"
 )
@@ -46,6 +47,9 @@ func GinRateLimiterMiddleware(
 	}
 
 	return func(c *gin.Context) {
+		// log endpoint and client ip
+		log.Log.Infof(c.Request.Context(), "http request received: endpoint: %s, client ip: %s", c.Request.URL.Path, c.ClientIP())
+
 		// Skip rate limit check for specified endpoints
 		for _, endpoint := range o.endpointsToSkipRLCheck {
 			if strings.HasPrefix(c.Request.URL.Path, endpoint) {
