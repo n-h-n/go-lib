@@ -60,25 +60,31 @@ func (client *Client) EnsureIndicesExist(
 
 			accountedFor := []string{}
 			for _, index := range indices[coll] {
-				accountedFor = append(accountedFor, *index.Options.Name)
-				if !slices.Contains(indexNames, *index.Options.Name) {
+				indexName := *index.Options.Name
+				accountedFor = append(accountedFor, indexName)
+				indexExists := slices.Contains(indexNames, indexName)
+
+				// If reindex is enabled and index exists, drop it first so we can recreate with new definition
+				if indexExists && reindex {
 					if client.verboseMode {
-						log.Log.Debugf(client.ctx, "index %s not found, creating index on collection %s.%s", *index.Options.Name, database.String(), coll)
+						log.Log.Debugf(client.ctx, "reindex enabled, dropping existing index %s on collection %s.%s to recreate", indexName, database.String(), coll)
+					}
+					_, err = collection.Indexes().DropOne(client.ctx, indexName)
+					if err != nil {
+						log.Log.Warnf(client.ctx, "failed to drop index %s for reindex: %v", indexName, err)
+					} else {
+						indexExists = false
+					}
+				}
+
+				// Create index if it doesn't exist (or was just dropped for reindex)
+				if !indexExists {
+					if client.verboseMode {
+						log.Log.Debugf(client.ctx, "creating index %s on collection %s.%s", indexName, database.String(), coll)
 					}
 					_, err = collection.Indexes().CreateOne(client.ctx, index)
-				}
-				if err != nil {
-					if reindex && strings.Contains(err.Error(), "already exists") {
-						if client.verboseMode {
-							log.Log.Debugf(client.ctx, "client reindexing enabled, dropping index %s on collection %s and recreating", *index.Options.Name, coll)
-						}
-						re := regexp.MustCompile(`name:\s*(\S+)`)
-						match := re.FindStringSubmatch(err.Error())
-						if len(match) > 1 {
-							collection.Indexes().DropOne(client.ctx, match[1])
-							collection.Indexes().CreateOne(client.ctx, index)
-						}
-					} else {
+					if err != nil {
+						log.Log.Errorf(client.ctx, "failed to create index %s on collection %s: %v", indexName, coll, err)
 						return err
 					}
 				}
@@ -152,7 +158,7 @@ func (client *Client) UpdateIndex(
 
 func (c *Client) EnsureSearchIndicesExist(
 	database Database,
-	indicesSpecs ...map[Collection][]*SearchIndexModel,
+	indicesSpecs ...map[Collection]map[string]*SearchIndexModel,
 ) error {
 	availableCollections, err := c.ListCollectionNames(database, nil)
 	if err != nil {
@@ -160,7 +166,7 @@ func (c *Client) EnsureSearchIndicesExist(
 	}
 
 	collections := []Collection{}
-	indices := make(map[Collection][]*SearchIndexModel)
+	indices := make(map[Collection]map[string]*SearchIndexModel)
 	for _, spec := range indicesSpecs {
 		for k, v := range spec {
 			collections = append(collections, k)

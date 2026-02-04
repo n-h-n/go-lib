@@ -2,6 +2,7 @@ package mongodb
 
 import (
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
 	"golang.org/x/exp/slices"
 )
 
@@ -61,4 +62,67 @@ func hasSearchInArray(arr bson.A) bool {
 		}
 	}
 	return false
+}
+
+// buildVectorSearchPipeline creates a MongoDB aggregation pipeline for vector search
+func BuildVectorSearchPipeline(
+	queryVector []float32,
+	searchIndexModel *SearchIndexModel,
+	opts ...SearchOption,
+) []bson.D {
+	// Apply options
+	searchOpts := &SearchOptions{
+		Exact:         false,
+		Limit:         10,
+		NumCandidates: 100,
+		EmbeddingPath: "_embeddings.full_context_embedding",
+		ScoreCutoff: &EqualityFilter{
+			FieldName: "_embeddings.last_search_score",
+			Value:     0.5,
+			Operator:  EqualityOperatorGreaterThanOrEqual,
+		},
+	}
+	for _, opt := range opts {
+		opt(searchOpts)
+	}
+
+	// Build $vectorSearch stage
+	// See: https://www.mongodb.com/docs/atlas/atlas-vector-search/vector-search-stage/
+	vectorSearchStage := bson.D{
+		{Key: "$vectorSearch", Value: bson.D{
+			{Key: "exact", Value: searchOpts.Exact},
+			{Key: "index", Value: searchIndexModel.Name},
+			{Key: "path", Value: searchOpts.EmbeddingPath},
+			{Key: "queryVector", Value: queryVector},
+			{Key: "numCandidates", Value: searchOpts.NumCandidates},
+			{Key: "limit", Value: searchOpts.Limit},
+		}},
+	}
+
+	// Build pipeline with $addFields to include search score
+	pipeline := mongo.Pipeline{
+		vectorSearchStage,
+		bson.D{
+			{Key: "$set", Value: bson.D{
+				{Key: "_embeddings.last_search_score", Value: bson.D{
+					{Key: "$meta", Value: "vectorSearchScore"},
+				}},
+			}},
+		},
+		bson.D{
+			{Key: "$match", Value: bson.D{
+				{Key: searchOpts.ScoreCutoff.FieldName, Value: bson.D{
+					{Key: string(searchOpts.ScoreCutoff.Operator), Value: searchOpts.ScoreCutoff.Value},
+				}},
+			}},
+		},
+		bson.D{
+			{Key: "$sort", Value: searchOpts.Sort},
+		},
+		bson.D{
+			{Key: "$limit", Value: searchOpts.Limit},
+		},
+	}
+
+	return pipeline
 }

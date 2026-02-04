@@ -45,8 +45,17 @@ type Document interface {
 type Collection string
 type Database string
 
+type SearchIndexType string
+
+const (
+	SearchIndexTypeVectorSearch SearchIndexType = "vectorSearch"
+	SearchIndexTypeTextSearch   SearchIndexType = "textSearch"
+)
+
 type SearchIndexModel struct {
 	SearchIndex mongo.SearchIndexModel
+	Type        SearchIndexType
+	Name        string
 	Reindex     bool
 }
 
@@ -73,7 +82,17 @@ func (r *Metadata) Set(ver int) {
 	r.UpdatedAt = time.Now()
 }
 
+type Embeddings struct {
+	FullContextEmbedding []float32 `json:"full_context_embedding,omitempty" bson:"full_context_embedding,omitempty"`
+	EmbeddingModifiedAt  time.Time `json:"embedding_modified_at,omitempty" bson:"embedding_modified_at,omitempty"`
+	LastSearchScore      float64   `json:"last_search_score,omitempty" bson:"last_search_score,omitempty"`
+	LastSearchString     string    `json:"last_search_string,omitempty" bson:"last_search_string,omitempty"`
+	LastSearchVector     []float32 `json:"last_search_vector,omitempty" bson:"last_search_vector,omitempty"`
+	LastSearchTime       time.Time `json:"last_search_time,omitempty" bson:"last_search_time,omitempty"`
+}
+
 type SearchOptions struct {
+	EmbeddingPath string
 	Limit         int
 	NumCandidates int
 	Exact         bool
@@ -98,6 +117,12 @@ func WithNumCandidates(numCandidates int) SearchOption {
 func WithExact(exact bool) SearchOption {
 	return func(opts *SearchOptions) {
 		opts.Exact = exact
+	}
+}
+
+func WithEmbeddingPath(embeddingPath string) SearchOption {
+	return func(opts *SearchOptions) {
+		opts.EmbeddingPath = embeddingPath
 	}
 }
 
