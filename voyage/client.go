@@ -20,10 +20,20 @@ import (
 // =============================================================================
 // Voyage AI provides embedding models for semantic search and retrieval.
 // API Reference: https://docs.voyageai.com/reference/embeddings-api
+// Rate Limits:  https://docs.voyageai.com/docs/rate-limits
 //
-// Rate Limits (default):
-// - 2,000 requests per minute
-// - 3,000,000 tokens per minute
+// Basic rate limits (Tier 1) vary by model:
+//   Model                    RPM    TPM
+//   voyage-4                 2000   8M
+//   voyage-4-lite            2000   16M
+//   voyage-4-large           2000   3M
+//   voyage-3.5               2000   8M
+//   voyage-3.5-lite          2000   16M
+//   voyage-3-large           2000   3M
+//   voyage-multimodal-3.5    2000   2M
+//   voyage-multimodal-3      2000   2M
+//
+// Tiers 2 and 3 multiply these limits by 2x and 3x respectively.
 //
 // Note: Voyage API does not return rate limit headers, so we use fixed limits.
 // =============================================================================
@@ -37,6 +47,7 @@ type Client struct {
 	redisClient       redis.UniversalClient
 	ctx               context.Context
 	rateLimiter       utils.RateLimiter
+	tokenRateLimiter  utils.RateLimiter // Tracks token consumption (model-dependent TPM)
 	baseURL           string
 	model             string
 	verboseMode       bool
@@ -58,17 +69,93 @@ type ClientConfig struct {
 	UseRedisRateLimit bool
 	RedisClient       redis.UniversalClient
 	RateLimit         RateConfig
+	TokenRateLimit    TokenRateConfig // Token-based rate limiting (optional)
 
 	// Elasticache client (optional, can be set after creation)
 	ElasticacheClient *elasticache.Client
 	VerboseMode       bool
 }
 
-// RateConfig defines rate limiting parameters
+// RateConfig defines request-based rate limiting parameters
 type RateConfig struct {
 	RequestsPerSecond int
 	BurstSize         int
 	Keyspace          string // For Redis rate limiting
+}
+
+// TokenRateConfig defines token-based rate limiting parameters.
+// Voyage AI enforces model-specific TPM (tokens per minute) limits alongside
+// the request limit. Token consumption is tracked using actual usage from API
+// responses, with character-based estimation (~5 chars/token) for pre-request gating.
+//
+// If TokensPerSecond is left at 0, NewClient will auto-select the correct limit
+// based on the configured model using ModelTokensPerMinute.
+type TokenRateConfig struct {
+	TokensPerSecond int
+	BurstSize       int
+	Keyspace        string // For Redis rate limiting (should differ from request keyspace)
+}
+
+// Token estimation constants
+const (
+	// charsPerToken is the average characters per token for Voyage models.
+	// Voyage docs state ~5 chars/token on average. We use 4.5 for a conservative
+	// overestimate (~11% buffer) to avoid underestimating pre-request.
+	charsPerToken = 4.5
+
+	// conservativeTPMFactor applies a 10% reduction to the published TPM limit
+	// to provide headroom and avoid hitting the exact boundary.
+	conservativeTPMFactor = 0.90
+)
+
+// ModelTokensPerMinute maps Voyage model names to their Tier 1 basic TPM limits.
+// Source: https://docs.voyageai.com/docs/rate-limits
+//
+// Tiers 2 (>=100 paid) and 3 (>=$1000 paid) multiply these by 2x and 3x.
+// If using a higher tier, set TokenRateConfig.TokensPerSecond explicitly.
+var ModelTokensPerMinute = map[string]int{
+	// 8M TPM models
+	"voyage-4":    8_000_000,
+	"voyage-3.5":  8_000_000,
+
+	// 16M TPM models
+	"voyage-4-lite":   16_000_000,
+	"voyage-3.5-lite": 16_000_000,
+	"voyage-4-nano":   16_000_000,
+
+	// 3M TPM models
+	"voyage-4-large":   3_000_000,
+	"voyage-3-large":   3_000_000,
+	"voyage-context-3": 3_000_000,
+	"voyage-code-3":    3_000_000,
+	"voyage-3":         3_000_000,
+	"voyage-code-2":    3_000_000,
+	"voyage-finance-2": 3_000_000,
+	"voyage-law-2":     3_000_000,
+	"voyage-large-2":   3_000_000,
+
+	// 2M TPM models
+	"voyage-multimodal-3.5": 2_000_000,
+	"voyage-multimodal-3":   2_000_000,
+}
+
+// tokenRateConfigForModel returns a TokenRateConfig with conservative defaults
+// derived from the model's published TPM limit. Falls back to 3M TPM for unknown models.
+func tokenRateConfigForModel(model string) TokenRateConfig {
+	tpm, ok := ModelTokensPerMinute[model]
+	if !ok {
+		tpm = 3_000_000 // Conservative fallback for unknown models
+	}
+
+	// Apply conservative factor and convert TPM -> tokens/second
+	effectiveTPM := int(float64(tpm) * conservativeTPMFactor)
+	tps := effectiveTPM / 60
+
+	return TokenRateConfig{
+		TokensPerSecond: tps,
+		BurstSize:       tps * 2, // Allow burst up to 2 seconds worth
+		Keyspace:        "{voyage:embeddings:tokens}",
+	}
 }
 
 // Default configurations
@@ -115,6 +202,14 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		cfg.RateLimit = DefaultRateConfig
 	}
 
+	// Auto-select token rate limit from model if not explicitly configured
+	if cfg.TokenRateLimit.TokensPerSecond == 0 {
+		cfg.TokenRateLimit = tokenRateConfigForModel(cfg.Model)
+	}
+	if cfg.TokenRateLimit.Keyspace == "" {
+		cfg.TokenRateLimit.Keyspace = "{voyage:embeddings:tokens}"
+	}
+
 	// Create HTTP client with Bearer token authentication
 	httpClient := &http.Client{
 		Transport: &bearerTokenTransport{
@@ -124,9 +219,13 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		Timeout: 60 * time.Second, // Embeddings can take longer for large batches
 	}
 
-	// Setup rate limiter
-	// Note: Voyage doesn't return rate limit headers, so we use a fixed limiter
+	// Setup rate limiters
+	// Note: Voyage doesn't return rate limit headers, so we use fixed limiters.
+	// We maintain two limiters:
+	//   1. Request rate limiter: gates by requests/second (2000 req/min)
+	//   2. Token rate limiter: gates by tokens/second (model-dependent TPM)
 	var rateLimiter utils.RateLimiter
+	var tokenRateLimiter utils.RateLimiter
 	if cfg.UseRedisRateLimit && cfg.RedisClient != nil {
 		// Use Redis rate limiter for distributed rate limiting
 		redisLimiter := rlim.NewLimiter(
@@ -137,6 +236,16 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 			),
 		)
 		rateLimiter = utils.NewRedisRateLimiterWrapper(redisLimiter, false)
+
+		// Token rate limiter (distributed)
+		redisTokenLimiter := rlim.NewLimiter(
+			rlim.WithDistributedLimiter(
+				cfg.RedisClient,
+				rlim.PerSecond(cfg.TokenRateLimit.TokensPerSecond, cfg.TokenRateLimit.BurstSize),
+				cfg.TokenRateLimit.Keyspace,
+			),
+		)
+		tokenRateLimiter = utils.NewRedisRateLimiterWrapper(redisTokenLimiter, false)
 	} else {
 		// Use local rate limiter (default)
 		localLimiter := llim.NewLimiter(
@@ -148,6 +257,17 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 			),
 		)
 		rateLimiter = utils.NewLocalRateLimiterWrapper(localLimiter, false)
+
+		// Token rate limiter (local)
+		localTokenLimiter := llim.NewLimiter(
+			llim.WithLocalLimiter(
+				cfg.TokenRateLimit.Keyspace,
+				cfg.TokenRateLimit.TokensPerSecond,
+				time.Second,
+				cfg.TokenRateLimit.BurstSize,
+			),
+		)
+		tokenRateLimiter = utils.NewLocalRateLimiterWrapper(localTokenLimiter, false)
 	}
 
 	client := &Client{
@@ -158,12 +278,14 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		ctx:               cfg.Ctx,
 		httpClient:        httpClient,
 		rateLimiter:       rateLimiter,
+		tokenRateLimiter:  tokenRateLimiter,
 		baseURL:           cfg.BaseURL,
 		model:             cfg.Model,
 		verboseMode:       cfg.VerboseMode,
 	}
 
-	log.Log.Infof(cfg.Ctx, "Voyage client created with model: %s", cfg.Model)
+	log.Log.Infof(cfg.Ctx, "Voyage client created with model: %s (token limit: %d tokens/sec, burst: %d)",
+		cfg.Model, cfg.TokenRateLimit.TokensPerSecond, cfg.TokenRateLimit.BurstSize)
 
 	return client, nil
 }
@@ -239,10 +361,17 @@ func (c *Client) Close() error {
 		}
 	}
 
-	// Close the rate limiter if it has a Close method
+	// Close the request rate limiter if it has a Close method
 	if closer, ok := c.rateLimiter.(interface{ Close() error }); ok {
 		if err := closer.Close(); err != nil {
 			return fmt.Errorf("failed to close rate limiter: %w", err)
+		}
+	}
+
+	// Close the token rate limiter if it has a Close method
+	if closer, ok := c.tokenRateLimiter.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil {
+			return fmt.Errorf("failed to close token rate limiter: %w", err)
 		}
 	}
 

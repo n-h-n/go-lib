@@ -5,7 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
+
+	"github.com/n-h-n/go-lib/log"
 )
 
 // =============================================================================
@@ -100,7 +103,25 @@ type ErrorResponse struct {
 	} `json:"error"`
 }
 
-// GenerateEmbeddings creates embeddings for a batch of texts
+// EstimateTokens estimates the number of tokens for a list of texts using the
+// character-based heuristic from the Voyage AI documentation. Voyage tokenizers
+// average ~5 characters per token; we use 4.5 chars/token for a conservative
+// overestimate (~11% buffer) to avoid underestimating when used for rate limiting.
+//
+// For exact token counts, use the TotalTokens field from the EmbeddingResponse.Usage
+// after the API call completes.
+func EstimateTokens(texts []string) int {
+	totalChars := 0
+	for _, t := range texts {
+		totalChars += len(t)
+	}
+	return int(math.Ceil(float64(totalChars) / charsPerToken))
+}
+
+// GenerateEmbeddings creates embeddings for a batch of texts.
+// It enforces both request-level and token-level rate limits. Token budget is
+// estimated pre-request using character count heuristics, then corrected
+// post-request using the actual token count returned by the Voyage API.
 //
 // Parameters:
 // - ctx: Context for the request
@@ -124,6 +145,12 @@ func (c *Client) GenerateEmbeddings(ctx context.Context, texts []string, inputTy
 
 	if len(texts) > 128 {
 		return nil, fmt.Errorf("maximum 128 texts per request, got %d", len(texts))
+	}
+
+	// Pre-request: estimate token count and wait for token budget
+	estimatedTokens := EstimateTokens(texts)
+	if err := c.tokenRateLimiter.WaitN(ctx, estimatedTokens); err != nil {
+		return nil, fmt.Errorf("token rate limit exceeded: %w", err)
 	}
 
 	req := EmbeddingRequest{
@@ -159,6 +186,24 @@ func (c *Client) GenerateEmbeddings(ctx context.Context, texts []string, inputTy
 	var embResp EmbeddingResponse
 	if err := json.NewDecoder(resp.Body).Decode(&embResp); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	// Post-request: correct token budget using actual usage from the response.
+	// If we underestimated, consume the difference to keep the token bucket accurate.
+	// If we overestimated, we were conservative (safe for rate limiting).
+	actualTokens := embResp.Usage.TotalTokens
+	if actualTokens > estimatedTokens {
+		correction := actualTokens - estimatedTokens
+		if err := c.tokenRateLimiter.WaitN(ctx, correction); err != nil {
+			// Log but don't fail the request -- the embeddings are already computed
+			log.Log.Warnf(ctx, "token rate limit correction wait failed: %v (actual=%d, estimated=%d, correction=%d)",
+				err, actualTokens, estimatedTokens, correction)
+		}
+	}
+
+	if c.verboseMode {
+		log.Log.Debugf(ctx, "Voyage token usage: estimated=%d, actual=%d (texts=%d)",
+			estimatedTokens, actualTokens, len(texts))
 	}
 
 	// Extract embeddings in order

@@ -694,6 +694,38 @@ type RateLimitInfo struct {
 	RequestsRemaining int `json:"requests_remaining"`
 }
 
+// serverCooldown checks whether the server has imposed a cooldown via RetryAfter.
+// Returns the remaining cooldown duration, or 0 if no cooldown is active.
+// Caller must hold at least a read lock on mu.
+func serverCooldown(state *RateLimitState) time.Duration {
+	if state == nil || state.RetryAfter <= 0 {
+		return 0
+	}
+	remaining := state.RetryAfter - time.Since(state.LastSync)
+	if remaining <= 0 {
+		return 0
+	}
+	return remaining
+}
+
+// waitForServerCooldown blocks until any server-imposed cooldown expires or ctx is cancelled.
+func waitForServerCooldown(ctx context.Context, mu *sync.RWMutex, state *RateLimitState) error {
+	mu.RLock()
+	remaining := serverCooldown(state)
+	mu.RUnlock()
+
+	if remaining <= 0 {
+		return nil
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(remaining):
+		return nil
+	}
+}
+
 // Wrapper types to adapt the different limiter interfaces
 type redisLimiterWrapper struct {
 	limiter  interface{}
@@ -703,8 +735,14 @@ type redisLimiterWrapper struct {
 }
 
 func (w *redisLimiterWrapper) Allow(ctx context.Context) bool {
-	// Use reflection or type assertion to call Allow
-	// Both rlim.Limiter and llim.Limiter have Allow(ctx context.Context) bool
+	// If the server imposed a cooldown via RetryAfter, reject immediately
+	w.mu.RLock()
+	cooldown := serverCooldown(w.state)
+	w.mu.RUnlock()
+	if cooldown > 0 {
+		return false
+	}
+
 	if l, ok := w.limiter.(interface{ Allow(context.Context) bool }); ok {
 		return l.Allow(ctx)
 	}
@@ -712,17 +750,24 @@ func (w *redisLimiterWrapper) Allow(ctx context.Context) bool {
 }
 
 func (w *redisLimiterWrapper) Wait(ctx context.Context) error {
-	// Call Wait with no options - both limiters support variadic opts
+	// Honor server-imposed cooldown before delegating to the underlying limiter
+	if err := waitForServerCooldown(ctx, &w.mu, w.state); err != nil {
+		return err
+	}
+
 	if l, ok := w.limiter.(interface {
 		Wait(context.Context, ...interface{}) error
 	}); ok {
 		return l.Wait(ctx)
 	}
-	// Fallback: try calling with empty variadic args using reflection
 	return w.callWait(ctx)
 }
 
 func (w *redisLimiterWrapper) WaitN(ctx context.Context, n int) error {
+	if err := waitForServerCooldown(ctx, &w.mu, w.state); err != nil {
+		return err
+	}
+
 	if l, ok := w.limiter.(interface {
 		WaitN(context.Context, int, ...interface{}) error
 	}); ok {
@@ -732,7 +777,6 @@ func (w *redisLimiterWrapper) WaitN(ctx context.Context, n int) error {
 }
 
 func (w *redisLimiterWrapper) callWait(ctx context.Context) error {
-	// Use reflection to call Wait with empty variadic args
 	method := reflect.ValueOf(w.limiter).MethodByName("Wait")
 	if !method.IsValid() {
 		return fmt.Errorf("limiter does not have Wait method")
@@ -787,7 +831,6 @@ func (w *redisLimiterWrapper) GetCurrentState() *RateLimitState {
 		return &RateLimitState{}
 	}
 
-	// Return a copy to avoid race conditions
 	return &RateLimitState{
 		RequestsLimit:     w.state.RequestsLimit,
 		RequestsRemaining: w.state.RequestsRemaining,
@@ -801,11 +844,17 @@ type localLimiterWrapper struct {
 	state    *RateLimitState
 	lastSync time.Time
 	mu       sync.RWMutex
-	// Adaptive rate limiting state
-	adaptiveMode bool
 }
 
 func (w *localLimiterWrapper) Allow(ctx context.Context) bool {
+	// If the server imposed a cooldown via RetryAfter, reject immediately
+	w.mu.RLock()
+	cooldown := serverCooldown(w.state)
+	w.mu.RUnlock()
+	if cooldown > 0 {
+		return false
+	}
+
 	if l, ok := w.limiter.(interface{ Allow(context.Context) bool }); ok {
 		return l.Allow(ctx)
 	}
@@ -813,6 +862,11 @@ func (w *localLimiterWrapper) Allow(ctx context.Context) bool {
 }
 
 func (w *localLimiterWrapper) Wait(ctx context.Context) error {
+	// Honor server-imposed cooldown before delegating to the underlying limiter
+	if err := waitForServerCooldown(ctx, &w.mu, w.state); err != nil {
+		return err
+	}
+
 	if l, ok := w.limiter.(interface {
 		Wait(context.Context, ...interface{}) error
 	}); ok {
@@ -822,6 +876,10 @@ func (w *localLimiterWrapper) Wait(ctx context.Context) error {
 }
 
 func (w *localLimiterWrapper) WaitN(ctx context.Context, n int) error {
+	if err := waitForServerCooldown(ctx, &w.mu, w.state); err != nil {
+		return err
+	}
+
 	if l, ok := w.limiter.(interface {
 		WaitN(context.Context, int, ...interface{}) error
 	}); ok {
@@ -874,11 +932,6 @@ func (w *localLimiterWrapper) SyncFromHeaders(rateLimitInfo *RateLimitInfo) erro
 	w.state.LastSync = time.Now()
 	w.lastSync = time.Now()
 
-	// Enable adaptive mode if we have valid rate limit info
-	if rateLimitInfo.RequestsLimit > 0 {
-		w.adaptiveMode = true
-	}
-
 	return nil
 }
 
@@ -890,7 +943,6 @@ func (w *localLimiterWrapper) GetCurrentState() *RateLimitState {
 		return &RateLimitState{}
 	}
 
-	// Return a copy to avoid race conditions
 	return &RateLimitState{
 		RequestsLimit:     w.state.RequestsLimit,
 		RequestsRemaining: w.state.RequestsRemaining,
