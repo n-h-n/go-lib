@@ -116,13 +116,19 @@ func BuildVectorSearchPipeline(
 				}},
 			}},
 		},
-		bson.D{
-			{Key: "$sort", Value: searchOpts.Sort},
-		},
-		bson.D{
-			{Key: "$limit", Value: searchOpts.Limit},
-		},
 	}
+
+	// Only include $sort if a sort order was explicitly provided.
+	// $vectorSearch already returns results in score-descending order.
+	if len(searchOpts.Sort) > 0 {
+		pipeline = append(pipeline, bson.D{
+			{Key: "$sort", Value: searchOpts.Sort},
+		})
+	}
+
+	pipeline = append(pipeline, bson.D{
+		{Key: "$limit", Value: searchOpts.Limit},
+	})
 
 	return pipeline
 }

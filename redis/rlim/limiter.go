@@ -20,6 +20,7 @@ type Limiter interface {
 	Allow(ctx context.Context) bool
 	Wait(ctx context.Context, opts ...waitOpt) error
 	WaitN(ctx context.Context, n int, opts ...waitOpt) error
+	Remaining(ctx context.Context) int
 }
 
 type localLimiter struct {
@@ -152,6 +153,14 @@ func (l *distributedLimiter) Allow(ctx context.Context) bool {
 	return true
 }
 
+func (l *distributedLimiter) Remaining(ctx context.Context) int {
+	res, err := l.limiter.AllowN(ctx, l.keyspace, l.limit, 0)
+	if err != nil || res == nil {
+		return -1
+	}
+	return res.Remaining
+}
+
 func (l *localLimiter) Allow(ctx context.Context) bool {
 	return l.limiter.Allow()
 }
@@ -162,4 +171,8 @@ func (l *localLimiter) Wait(ctx context.Context) error {
 
 func (l *localLimiter) WaitN(ctx context.Context, n int) error {
 	return l.limiter.WaitN(ctx, n)
+}
+
+func (l *localLimiter) Remaining(ctx context.Context) int {
+	return int(l.limiter.Tokens())
 }

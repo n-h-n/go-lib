@@ -11,6 +11,7 @@ type Limiter interface {
 	Allow(ctx context.Context) bool
 	Wait(ctx context.Context, opts ...waitOpt) error
 	WaitN(ctx context.Context, n int, opts ...waitOpt) error
+	Remaining(ctx context.Context) int
 }
 
 type limiter struct {
@@ -144,6 +145,13 @@ func (l *limiter) allowN(n int) *Result {
 func (l *limiter) Allow(ctx context.Context) bool {
 	result := l.allowN(1)
 	return result.Allowed > 0
+}
+
+func (l *limiter) Remaining(ctx context.Context) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.refillTokens()
+	return l.tokens
 }
 
 func (l *limiter) Wait(ctx context.Context, opts ...waitOpt) error {

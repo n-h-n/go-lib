@@ -669,6 +669,7 @@ type RateLimiter interface {
 	Allow(ctx context.Context) bool
 	Wait(ctx context.Context) error
 	WaitN(ctx context.Context, n int) error
+	Remaining(ctx context.Context) int
 	Close() error
 }
 
@@ -802,6 +803,13 @@ func (w *redisLimiterWrapper) callWaitN(ctx context.Context, n int) error {
 	return nil
 }
 
+func (w *redisLimiterWrapper) Remaining(ctx context.Context) int {
+	if l, ok := w.limiter.(interface{ Remaining(context.Context) int }); ok {
+		return l.Remaining(ctx)
+	}
+	return -1
+}
+
 func (w *redisLimiterWrapper) Close() error {
 	return nil
 }
@@ -914,6 +922,13 @@ func (w *localLimiterWrapper) callWaitN(ctx context.Context, n int) error {
 	return nil
 }
 
+func (w *localLimiterWrapper) Remaining(ctx context.Context) int {
+	if l, ok := w.limiter.(interface{ Remaining(context.Context) int }); ok {
+		return l.Remaining(ctx)
+	}
+	return -1
+}
+
 func (w *localLimiterWrapper) Close() error {
 	return nil
 }
@@ -1007,6 +1022,13 @@ func (w *simpleRedisLimiterWrapper) callWaitN(ctx context.Context, n int) error 
 	return nil
 }
 
+func (w *simpleRedisLimiterWrapper) Remaining(ctx context.Context) int {
+	if l, ok := w.limiter.(interface{ Remaining(context.Context) int }); ok {
+		return l.Remaining(ctx)
+	}
+	return -1
+}
+
 func (w *simpleRedisLimiterWrapper) Close() error {
 	return nil
 }
@@ -1064,6 +1086,13 @@ func (w *simpleLocalLimiterWrapper) callWaitN(ctx context.Context, n int) error 
 		return result[0].Interface().(error)
 	}
 	return nil
+}
+
+func (w *simpleLocalLimiterWrapper) Remaining(ctx context.Context) int {
+	if l, ok := w.limiter.(interface{ Remaining(context.Context) int }); ok {
+		return l.Remaining(ctx)
+	}
+	return -1
 }
 
 func (w *simpleLocalLimiterWrapper) Close() error {

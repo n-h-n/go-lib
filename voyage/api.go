@@ -202,8 +202,10 @@ func (c *Client) GenerateEmbeddings(ctx context.Context, texts []string, inputTy
 	}
 
 	if c.verboseMode {
-		log.Log.Debugf(ctx, "Voyage token usage: estimated=%d, actual=%d (texts=%d)",
-			estimatedTokens, actualTokens, len(texts))
+		tokensRemaining := c.tokenRateLimiter.Remaining(ctx)
+		requestsRemaining := c.rateLimiter.Remaining(ctx)
+		log.Log.Debugf(ctx, "Voyage usage: estimated=%d, actual=%d (texts=%d) | bucket remaining: ~%d TPM, ~%d RPM",
+			estimatedTokens, actualTokens, len(texts), tokensRemaining*60, requestsRemaining*60)
 	}
 
 	// Extract embeddings in order
