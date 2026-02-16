@@ -86,12 +86,19 @@ func BuildVectorSearchPipeline(
 		opt(searchOpts)
 	}
 
+	// Resolve the index name: prefer the explicit Name field, fall back to
+	// the name set via SearchIndex.Options (SetName).
+	indexName := searchIndexModel.Name
+	if indexName == "" && searchIndexModel.SearchIndex.Options != nil && searchIndexModel.SearchIndex.Options.Name != nil {
+		indexName = *searchIndexModel.SearchIndex.Options.Name
+	}
+
 	// Build $vectorSearch stage
 	// See: https://www.mongodb.com/docs/atlas/atlas-vector-search/vector-search-stage/
 	vectorSearchStage := bson.D{
 		{Key: "$vectorSearch", Value: bson.D{
 			{Key: "exact", Value: searchOpts.Exact},
-			{Key: "index", Value: searchIndexModel.Name},
+			{Key: "index", Value: indexName},
 			{Key: "path", Value: searchOpts.EmbeddingPath},
 			{Key: "queryVector", Value: queryVector},
 			{Key: "numCandidates", Value: searchOpts.NumCandidates},
