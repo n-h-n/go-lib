@@ -9,13 +9,13 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-type limiterOpt func(*limiterOptions) error
+type LimiterOpt func(*limiterOptions) error
 
 // WithLocalLimiter sets the limiter type to local and sets the rate.
 func WithLocalLimiter(
 	rate rate.Limit,
 	burst int,
-) limiterOpt {
+) LimiterOpt {
 	return func(o *limiterOptions) error {
 		if o.limiterType != "" {
 			return fmt.Errorf("limiter type already set to %s", o.limiterType)
@@ -31,7 +31,7 @@ func WithDistributedLimiter(
 	redisClient redis.UniversalClient,
 	limit redis_rate.Limit,
 	key string,
-) limiterOpt {
+) LimiterOpt {
 	return func(o *limiterOptions) error {
 		if o.limiterType != "" {
 			return fmt.Errorf("limiter type already set to %s", o.limiterType)
@@ -40,6 +40,16 @@ func WithDistributedLimiter(
 		o.distributed.redisClient = &redisClient
 		o.distributed.keyspace = key
 		o.distributed.limit = limit
+		return nil
+	}
+}
+
+// WithClientRefresh sets a function that returns a fresh redis.UniversalClient.
+// On auth errors (WRONGPASS/NOAUTH), the limiter calls this to swap in a
+// re-authenticated client and treats the current request as rate-limited.
+func WithClientRefresh(fn func() redis.UniversalClient) LimiterOpt {
+	return func(o *limiterOptions) error {
+		o.distributed.clientRefresh = fn
 		return nil
 	}
 }

@@ -3,11 +3,13 @@ package rlim
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"golang.org/x/time/rate"
 
 	"github.com/go-redis/redis_rate/v10"
+	"github.com/n-h-n/go-lib/log"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -28,9 +30,10 @@ type localLimiter struct {
 }
 
 type distributedLimiter struct {
-	limiter  *redis_rate.Limiter
-	keyspace string
-	limit    redis_rate.Limit
+	limiter       *redis_rate.Limiter
+	keyspace      string
+	limit         redis_rate.Limit
+	clientRefresh func() redis.UniversalClient
 }
 
 type wait struct {
@@ -42,9 +45,10 @@ type wait struct {
 type limiterOptions struct {
 	limiterType limiterType
 	distributed struct {
-		redisClient *redis.UniversalClient
-		keyspace    string
-		limit       redis_rate.Limit
+		redisClient   *redis.UniversalClient
+		keyspace      string
+		limit         redis_rate.Limit
+		clientRefresh func() redis.UniversalClient
 	}
 	local struct {
 		rate  rate.Limit
@@ -54,7 +58,7 @@ type limiterOptions struct {
 
 type limiterType string
 
-func NewLimiter(opts ...limiterOpt) Limiter {
+func NewLimiter(opts ...LimiterOpt) Limiter {
 
 	limiterOpts := &limiterOptions{}
 	for _, opt := range opts {
@@ -68,9 +72,10 @@ func NewLimiter(opts ...limiterOpt) Limiter {
 	}
 
 	return &distributedLimiter{
-		limiter:  redis_rate.NewLimiter(*limiterOpts.distributed.redisClient),
-		keyspace: limiterOpts.distributed.keyspace,
-		limit:    limiterOpts.distributed.limit,
+		limiter:       redis_rate.NewLimiter(*limiterOpts.distributed.redisClient),
+		keyspace:      limiterOpts.distributed.keyspace,
+		limit:         limiterOpts.distributed.limit,
+		clientRefresh: limiterOpts.distributed.clientRefresh,
 	}
 }
 
@@ -96,7 +101,7 @@ func (l *distributedLimiter) WaitN(ctx context.Context, n int, opts ...waitOpt) 
 
 	go func() {
 		for {
-			res, err := l.limiter.AllowN(ctx, l.keyspace, l.limit, n)
+			res, err := l.allowN(ctx, n, false)
 			if err != nil {
 				errChan <- err
 				break
@@ -141,9 +146,19 @@ func (l *distributedLimiter) WaitN(ctx context.Context, n int, opts ...waitOpt) 
 }
 
 func (l *distributedLimiter) Allow(ctx context.Context) bool {
+	return l.allow(ctx, false)
+}
+
+func (l *distributedLimiter) allow(ctx context.Context, retried bool) bool {
 	res, err := l.limiter.Allow(ctx, l.keyspace, l.limit)
 	if err != nil {
-		panic(err)
+		if !retried && l.clientRefresh != nil && isAuthError(err) {
+			log.Log.Warnf(ctx, "redis auth failure detected, refreshing client for keyspace %s", l.keyspace)
+			l.limiter = redis_rate.NewLimiter(l.clientRefresh())
+			return l.allow(ctx, true)
+		}
+		log.Log.Errorf(ctx, "distributed rate limiter error: %v", err)
+		return false
 	}
 
 	if res.Remaining == 0 {
@@ -153,8 +168,29 @@ func (l *distributedLimiter) Allow(ctx context.Context) bool {
 	return true
 }
 
+func (l *distributedLimiter) allowN(
+	ctx context.Context,
+	n int,
+	retried bool,
+) (*redis_rate.Result, error) {
+	res, err := l.limiter.AllowN(ctx, l.keyspace, l.limit, n)
+	if err != nil {
+		if !retried && l.clientRefresh != nil && isAuthError(err) {
+			log.Log.Warnf(ctx, "redis auth failure detected, refreshing client for keyspace %s", l.keyspace)
+			l.limiter = redis_rate.NewLimiter(l.clientRefresh())
+			return l.allowN(ctx, n, true)
+		}
+		return nil, err
+	}
+	return res, nil
+}
+
+func isAuthError(err error) bool {
+	return strings.Contains(err.Error(), "WRONGPASS") || strings.Contains(err.Error(), "NOAUTH")
+}
+
 func (l *distributedLimiter) Remaining(ctx context.Context) int {
-	res, err := l.limiter.AllowN(ctx, l.keyspace, l.limit, 0)
+	res, err := l.allowN(ctx, 0, false)
 	if err != nil || res == nil {
 		return -1
 	}

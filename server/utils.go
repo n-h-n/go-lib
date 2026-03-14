@@ -31,9 +31,9 @@ func GinRateLimiterMiddleware(
 		redisClient:            nil,
 	}
 
-	// Extract redisClient from elasticacheClient if available
 	if elasticacheClient != nil {
 		o.redisClient = elasticacheClient.GetRedisClient()
+		o.clientRefresh = elasticacheClient.RefreshAndGetRedisClient
 	}
 
 	for _, opt := range opts {
@@ -76,7 +76,7 @@ func GinRateLimiterMiddleware(
 
 		// Check rate limits
 		for _, key := range keys {
-			limiter := limiterCache.getOrCreateLimiter(key, rl, o.useRedisRateLimit, o.redisClient)
+			limiter := limiterCache.getOrCreateLimiter(key, rl, o.useRedisRateLimit, o.redisClient, o.clientRefresh)
 			if !limiter.Allow(c.Request.Context()) {
 				c.AbortWithStatusJSON(
 					http.StatusTooManyRequests,
@@ -108,6 +108,7 @@ func (lc *limiterCache) getOrCreateLimiter(
 	limit redis_rate.Limit,
 	useRedis bool,
 	redisClient redis.UniversalClient,
+	clientRefresh func() redis.UniversalClient,
 ) utils.RateLimiter {
 	// Try to get existing limiter
 	lc.mu.RLock()
@@ -129,14 +130,17 @@ func (lc *limiterCache) getOrCreateLimiter(
 	var limiter utils.RateLimiter
 
 	if useRedis && redisClient != nil {
-		// Use Redis-based distributed rate limiting
-		redisLimiter := rlim.NewLimiter(
+		limiterOpts := []rlim.LimiterOpt{
 			rlim.WithDistributedLimiter(
 				redisClient,
 				limit,
 				key,
 			),
-		)
+		}
+		if clientRefresh != nil {
+			limiterOpts = append(limiterOpts, rlim.WithClientRefresh(clientRefresh))
+		}
+		redisLimiter := rlim.NewLimiter(limiterOpts...)
 		limiter = utils.NewRedisRateLimiterWrapper(redisLimiter, false)
 	} else {
 		// Use local in-memory rate limiting
@@ -170,6 +174,7 @@ type rateLimiterMiddlewareOptions struct {
 	serviceName            string
 	useRedisRateLimit      bool
 	redisClient            redis.UniversalClient
+	clientRefresh          func() redis.UniversalClient
 }
 
 func WithGinRLMWEndpointCustomRLs(rls map[string]redis_rate.Limit) func(*rateLimiterMiddlewareOptions) {

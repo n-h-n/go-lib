@@ -21,10 +21,13 @@ type Client struct {
 	iamClient          iam.IAMClient
 	replicationGroupID string
 	token              string
+	clientConnectedAt  time.Time
 	clusterMode        bool
 	verboseMode        bool
 	ctx                context.Context
 }
+
+const proactiveClientRefreshAfter = 11*time.Hour + 30*time.Minute
 
 func NewClient(ctx context.Context, replicationGroupID string, verboseMode bool, clientOptions ...clientOpt) (*Client, error) {
 	c := &Client{
@@ -48,6 +51,9 @@ func NewClient(ctx context.Context, replicationGroupID string, verboseMode bool,
 
 	if c.redisClient == nil {
 		return nil, fmt.Errorf("redis client cannot be nil, please provide a redis client")
+	}
+	if c.clientConnectedAt.IsZero() {
+		c.clientConnectedAt = time.Now()
 	}
 
 	if err := c.writeTokenToLocalFile(); err != nil {
@@ -101,8 +107,10 @@ func (c *Client) newDefaultRedisClusterClient(redisURI []string) (redis.Universa
 	return redisClient, nil
 }
 
-func (c *Client) refreshRedisClient() error {
-	if c.iamClient.GetSessionTimeRemaining().Seconds() > c.iamClient.GetSessionDuration().Seconds()*c.iamClient.GetRefreshPercentage() {
+func (c *Client) refreshRedisClient(force bool) error {
+	forceDueToConnectionAge := !c.clientConnectedAt.IsZero() && time.Since(c.clientConnectedAt) >= proactiveClientRefreshAfter
+	if !force && !forceDueToConnectionAge &&
+		c.iamClient.GetSessionTimeRemaining().Seconds() > c.iamClient.GetSessionDuration().Seconds()*c.iamClient.GetRefreshPercentage() {
 		if c.verboseMode {
 			log.Log.Debugf(c.ctx, "redis client: session time remaining is %v, refreshing at threshold in %v",
 				c.iamClient.GetSessionTimeRemaining(),
@@ -110,6 +118,9 @@ func (c *Client) refreshRedisClient() error {
 			)
 		}
 		return nil
+	}
+	if forceDueToConnectionAge {
+		log.Log.Infof(c.ctx, "forcing redis client refresh after %s connection age", proactiveClientRefreshAfter)
 	}
 
 	if c.verboseMode {
@@ -129,6 +140,7 @@ func (c *Client) refreshRedisClient() error {
 		}
 
 		c.redisClient = newClient
+		c.clientConnectedAt = time.Now()
 	} else {
 		newClient, newClientErr := c.newDefaultRedisClient(c.redisURI[0])
 
@@ -138,12 +150,17 @@ func (c *Client) refreshRedisClient() error {
 		}
 
 		c.redisClient = newClient
+		c.clientConnectedAt = time.Now()
 	}
 
 	pingResp, err := c.Ping(c.ctx).Result()
 	if err != nil {
 		log.Log.Errorf(c.ctx, "while refreshing redis creds, failed to ping redis client: %v, retrying....", err)
-		go c.refreshRedisClient()
+		go func() {
+			if retryErr := c.refreshRedisClient(true); retryErr != nil {
+				log.Log.Errorf(c.ctx, "retrying redis credential refresh failed: %v", retryErr)
+			}
+		}()
 		return err
 	}
 
@@ -174,7 +191,7 @@ func (c *Client) runPeriodicRefresh() {
 	for {
 		select {
 		case <-ticker.C:
-			if err := c.refreshRedisClient(); err != nil {
+			if err := c.refreshRedisClient(false); err != nil {
 				log.Log.Errorf(c.ctx, "failed to refresh redis client: %v", err)
 			}
 		case <-c.ctx.Done():
@@ -236,6 +253,16 @@ func (c *Client) Get(ctx context.Context, key string) *redis.StringCmd {
 }
 
 func (c *Client) GetRedisClient() redis.UniversalClient {
+	return c.redisClient
+}
+
+// RefreshAndGetRedisClient forces credential refresh and returns the latest
+// redis client. It is intended for callers that received auth errors and need
+// to recover immediately rather than waiting for periodic refresh.
+func (c *Client) RefreshAndGetRedisClient() redis.UniversalClient {
+	if err := c.refreshRedisClient(true); err != nil {
+		log.Log.Errorf(c.ctx, "failed to force refresh redis client: %v", err)
+	}
 	return c.redisClient
 }
 
