@@ -2937,7 +2937,11 @@ func WriteRowsToBigQuery[T Row](
 			// Calculate percentage before processing
 			currentCompleted := atomic.AddInt64(&completed, 0)
 			percentage := float64(currentCompleted) / float64(total) * 100
-			log.Log.Infof(ctx, logStartMsg(r, percentage))
+			if bigqueryClient != nil && bigqueryClient.IsVerbose() {
+				if msg := logStartMsg(r, percentage); msg != "" {
+					log.Log.Infof(ctx, msg)
+				}
+			}
 
 			r.SetMetadata()
 			err := bigqueryClient.UpsertRows(r) // Now has built-in retry logic
@@ -2948,8 +2952,10 @@ func WriteRowsToBigQuery[T Row](
 
 			if err != nil {
 				log.Log.Errorf(ctx, logResultMsg(r, newPercentage, true))
-			} else {
-				log.Log.Infof(ctx, logResultMsg(r, newPercentage, false))
+			} else if bigqueryClient != nil && bigqueryClient.IsVerbose() {
+				if msg := logResultMsg(r, newPercentage, false); msg != "" {
+					log.Log.Infof(ctx, msg)
+				}
 			}
 			resultChan <- result{index: index, err: err}
 		}(idx, row)
