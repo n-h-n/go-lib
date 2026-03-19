@@ -227,24 +227,32 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	var rateLimiter utils.RateLimiter
 	var tokenRateLimiter utils.RateLimiter
 	if cfg.UseRedisRateLimit && cfg.RedisClient != nil {
-		// Use Redis rate limiter for distributed rate limiting
-		redisLimiter := rlim.NewLimiter(
+		requestLimiterOpts := []rlim.LimiterOpt{
 			rlim.WithDistributedLimiter(
 				cfg.RedisClient,
 				rlim.PerSecond(cfg.RateLimit.RequestsPerSecond, cfg.RateLimit.BurstSize),
 				cfg.RateLimit.Keyspace,
 			),
-		)
-		rateLimiter = utils.NewRedisRateLimiterWrapper(redisLimiter, false)
-
-		// Token rate limiter (distributed)
-		redisTokenLimiter := rlim.NewLimiter(
+		}
+		tokenLimiterOpts := []rlim.LimiterOpt{
 			rlim.WithDistributedLimiter(
 				cfg.RedisClient,
 				rlim.PerSecond(cfg.TokenRateLimit.TokensPerSecond, cfg.TokenRateLimit.BurstSize),
 				cfg.TokenRateLimit.Keyspace,
 			),
-		)
+		}
+		if cfg.ElasticacheClient != nil {
+			clientRefresh := rlim.WithClientRefresh(cfg.ElasticacheClient.RefreshAndGetRedisClient)
+			requestLimiterOpts = append(requestLimiterOpts, clientRefresh)
+			tokenLimiterOpts = append(tokenLimiterOpts, clientRefresh)
+		}
+
+		// Use Redis rate limiter for distributed rate limiting
+		redisLimiter := rlim.NewLimiter(requestLimiterOpts...)
+		rateLimiter = utils.NewRedisRateLimiterWrapper(redisLimiter, false)
+
+		// Token rate limiter (distributed)
+		redisTokenLimiter := rlim.NewLimiter(tokenLimiterOpts...)
 		tokenRateLimiter = utils.NewRedisRateLimiterWrapper(redisTokenLimiter, false)
 	} else {
 		// Use local rate limiter (default)
