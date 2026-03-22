@@ -81,8 +81,10 @@ type clientOpts struct {
 }
 
 type TokenSource struct {
-	token *oauth2.Token
-	Type  string `json:"type,omitempty"`
+	client *IdentityFederationClient
+	mu     *sync.RWMutex
+	token  *oauth2.Token
+	Type   string `json:"type,omitempty"`
 }
 
 // Creates a simple IAM federation client to handle AWS and GCP tokens.
@@ -99,7 +101,7 @@ func NewIdentityFederationClient(ctx context.Context, gcpProjectID, gcpProjectNu
 			projectID:                   gcpProjectID,
 			projectNumber:               gcpProjectNum,
 			serviceAccountTokenResponse: new(gcpIAM.GenerateAccessTokenResponse),
-			tokenSource:                 &TokenSource{},
+			tokenSource:                 &TokenSource{mu: new(sync.RWMutex)},
 		},
 		opt: &clientOpts{
 			flagRefreshAlreadySet: false,
@@ -110,6 +112,7 @@ func NewIdentityFederationClient(ctx context.Context, gcpProjectID, gcpProjectNu
 		},
 		refreshMutex: new(sync.Mutex),
 	}
+	c.gcp.tokenSource.client = &c
 
 	// options
 	for _, option := range options {
@@ -361,7 +364,7 @@ func (c *IdentityFederationClient) getGCPAccessToken(ctx context.Context) error 
 
 	c.gcp.serviceAccountTokenUpdateTime = time.Now().UTC()
 	c.gcp.serviceAccountTokenResponse = accessTokenResponse
-	expirationTime, err := time.Parse("2006-01-02T15:04:05Z", c.gcp.serviceAccountTokenResponse.ExpireTime)
+	expirationTime, err := time.Parse(time.RFC3339Nano, c.gcp.serviceAccountTokenResponse.ExpireTime)
 	if err != nil {
 		return err
 	}
@@ -378,11 +381,14 @@ func (c *IdentityFederationClient) formOAuthToken(ctx context.Context) error {
 		log.Log.Info(ctx, "forming OAuth 2.0 token from service access token ....")
 	}
 
-	c.gcp.tokenSource.token = &oauth2.Token{
+	token := &oauth2.Token{
 		AccessToken: c.gcp.serviceAccountTokenResponse.AccessToken,
 		TokenType:   "Bearer",
 		Expiry:      c.gcp.serviceAccountTokenExpireTime,
 	}
+	c.gcp.tokenSource.mu.Lock()
+	c.gcp.tokenSource.token = token
+	c.gcp.tokenSource.mu.Unlock()
 
 	if c.opt.verbose {
 		log.Log.Info(ctx, "successfully formed OAuth 2.0 token")
@@ -391,6 +397,19 @@ func (c *IdentityFederationClient) formOAuthToken(ctx context.Context) error {
 }
 
 func (t *TokenSource) Token() (*oauth2.Token, error) {
+	if t == nil {
+		return nil, fmt.Errorf("token source is nil")
+	}
+	if t.client != nil {
+		if err := t.client.ensureUsableToken(context.Background()); err != nil {
+			return nil, err
+		}
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.token == nil {
+		return nil, fmt.Errorf("oauth token is not initialized")
+	}
 	return t.token, nil
 }
 
@@ -416,6 +435,23 @@ func (c *IdentityFederationClient) GetTokenSource(ctx context.Context) (*TokenSo
 		}
 	}
 	return c.gcp.tokenSource, nil
+}
+
+func (c *IdentityFederationClient) ensureUsableToken(ctx context.Context) error {
+	if c == nil {
+		return fmt.Errorf("identity federation client is nil")
+	}
+
+	timeRemaining := c.GetDurationUntilTokenExpiration(ctx).Seconds()
+	refreshThreshold := c.opt.refreshPercentage * float64(c.opt.tokenDurationSeconds)
+	if timeRemaining >= refreshThreshold {
+		return nil
+	}
+
+	if c.opt.verbose {
+		log.Log.Debugf(ctx, "token source requested refresh with %vs remaining (threshold %vs)", timeRemaining, refreshThreshold)
+	}
+	return c.authenticate(ctx)
 }
 
 // This is the main sequence of authentication to retrieve and exchange all the tokens.
@@ -518,6 +554,7 @@ func (c *IdentityFederationClient) StartPeriodicAuthRefresh(ctx context.Context)
 
 func (c *IdentityFederationClient) runPeriodicAuthRefresh(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
 
 	for {
 		select {
