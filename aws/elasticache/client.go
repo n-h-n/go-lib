@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,7 +28,10 @@ type Client struct {
 	ctx                context.Context
 }
 
-const proactiveClientRefreshAfter = 11*time.Hour + 30*time.Minute
+// ElastiCache IAM auth tokens expire after ~15 minutes. Refresh the client
+// ahead of that window so long-lived pods do not keep using stale credentials
+// and suddenly fail on the next Redis reconnect.
+const proactiveClientRefreshAfter = 12 * time.Minute
 
 func NewClient(ctx context.Context, replicationGroupID string, verboseMode bool, clientOptions ...clientOpt) (*Client, error) {
 	c := &Client{
@@ -241,15 +245,27 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) Del(ctx context.Context, keys ...string) *redis.IntCmd {
-	return c.redisClient.Del(ctx, keys...)
+	cmd := c.redisClient.Del(ctx, keys...)
+	if c.refreshOnAuthError(ctx, cmd.Err()) {
+		cmd = c.redisClient.Del(ctx, keys...)
+	}
+	return cmd
 }
 
 func (c *Client) Expire(ctx context.Context, key string, expiration time.Duration) *redis.BoolCmd {
-	return c.redisClient.Expire(ctx, key, expiration)
+	cmd := c.redisClient.Expire(ctx, key, expiration)
+	if c.refreshOnAuthError(ctx, cmd.Err()) {
+		cmd = c.redisClient.Expire(ctx, key, expiration)
+	}
+	return cmd
 }
 
 func (c *Client) Get(ctx context.Context, key string) *redis.StringCmd {
-	return c.redisClient.Get(ctx, key)
+	cmd := c.redisClient.Get(ctx, key)
+	if c.refreshOnAuthError(ctx, cmd.Err()) {
+		cmd = c.redisClient.Get(ctx, key)
+	}
+	return cmd
 }
 
 func (c *Client) GetRedisClient() redis.UniversalClient {
@@ -266,12 +282,40 @@ func (c *Client) RefreshAndGetRedisClient() redis.UniversalClient {
 	return c.redisClient
 }
 
+func isAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "WRONGPASS") || strings.Contains(msg, "NOAUTH")
+}
+
+func (c *Client) refreshOnAuthError(ctx context.Context, err error) bool {
+	if !isAuthError(err) {
+		return false
+	}
+	log.Log.Warnf(ctx, "redis auth failure detected, forcing elasticache client refresh")
+	if refreshErr := c.refreshRedisClient(true); refreshErr != nil {
+		log.Log.Errorf(ctx, "failed refreshing elasticache client after auth error: %v", refreshErr)
+		return false
+	}
+	return true
+}
+
 func (c *Client) HDel(ctx context.Context, key string, fields ...string) *redis.IntCmd {
-	return c.redisClient.HDel(ctx, key, fields...)
+	cmd := c.redisClient.HDel(ctx, key, fields...)
+	if c.refreshOnAuthError(ctx, cmd.Err()) {
+		cmd = c.redisClient.HDel(ctx, key, fields...)
+	}
+	return cmd
 }
 
 func (c *Client) HGet(ctx context.Context, key, field string) *redis.StringCmd {
-	return c.redisClient.HGet(ctx, key, field)
+	cmd := c.redisClient.HGet(ctx, key, field)
+	if c.refreshOnAuthError(ctx, cmd.Err()) {
+		cmd = c.redisClient.HGet(ctx, key, field)
+	}
+	return cmd
 }
 
 func (c *Client) HGetAll(ctx context.Context, key string) *redis.MapStringStringCmd {
@@ -283,19 +327,35 @@ func (c *Client) HIncrBy(ctx context.Context, key, field string, incr int64) *re
 }
 
 func (c *Client) HKeys(ctx context.Context, key string) *redis.StringSliceCmd {
-	return c.redisClient.HKeys(ctx, key)
+	cmd := c.redisClient.HKeys(ctx, key)
+	if c.refreshOnAuthError(ctx, cmd.Err()) {
+		cmd = c.redisClient.HKeys(ctx, key)
+	}
+	return cmd
 }
 
 func (c *Client) HLen(ctx context.Context, key string) *redis.IntCmd {
-	return c.redisClient.HLen(ctx, key)
+	cmd := c.redisClient.HLen(ctx, key)
+	if c.refreshOnAuthError(ctx, cmd.Err()) {
+		cmd = c.redisClient.HLen(ctx, key)
+	}
+	return cmd
 }
 
 func (c *Client) HMGet(ctx context.Context, key string, fields ...string) *redis.SliceCmd {
-	return c.redisClient.HMGet(ctx, key, fields...)
+	cmd := c.redisClient.HMGet(ctx, key, fields...)
+	if c.refreshOnAuthError(ctx, cmd.Err()) {
+		cmd = c.redisClient.HMGet(ctx, key, fields...)
+	}
+	return cmd
 }
 
 func (c *Client) HSet(ctx context.Context, key string, pairs ...interface{}) *redis.IntCmd {
-	return c.redisClient.HSet(ctx, key, pairs...)
+	cmd := c.redisClient.HSet(ctx, key, pairs...)
+	if c.refreshOnAuthError(ctx, cmd.Err()) {
+		cmd = c.redisClient.HSet(ctx, key, pairs...)
+	}
+	return cmd
 }
 
 func (c *Client) LLen(ctx context.Context, key string) *redis.IntCmd {
@@ -335,7 +395,11 @@ func (c *Client) RPush(ctx context.Context, key string, values ...interface{}) *
 }
 
 func (c *Client) SAdd(ctx context.Context, key string, members ...interface{}) *redis.IntCmd {
-	return c.redisClient.SAdd(ctx, key, members...)
+	cmd := c.redisClient.SAdd(ctx, key, members...)
+	if c.refreshOnAuthError(ctx, cmd.Err()) {
+		cmd = c.redisClient.SAdd(ctx, key, members...)
+	}
+	return cmd
 }
 
 func (c *Client) SCard(ctx context.Context, key string) *redis.IntCmd {
@@ -343,7 +407,11 @@ func (c *Client) SCard(ctx context.Context, key string) *redis.IntCmd {
 }
 
 func (c *Client) Set(ctx context.Context, key string, value interface{}, expiration time.Duration) *redis.StatusCmd {
-	return c.redisClient.Set(ctx, key, value, expiration)
+	cmd := c.redisClient.Set(ctx, key, value, expiration)
+	if c.refreshOnAuthError(ctx, cmd.Err()) {
+		cmd = c.redisClient.Set(ctx, key, value, expiration)
+	}
+	return cmd
 }
 
 func (c *Client) SIsMember(ctx context.Context, key string, member interface{}) *redis.BoolCmd {
@@ -351,11 +419,19 @@ func (c *Client) SIsMember(ctx context.Context, key string, member interface{}) 
 }
 
 func (c *Client) SMembers(ctx context.Context, key string) *redis.StringSliceCmd {
-	return c.redisClient.SMembers(ctx, key)
+	cmd := c.redisClient.SMembers(ctx, key)
+	if c.refreshOnAuthError(ctx, cmd.Err()) {
+		cmd = c.redisClient.SMembers(ctx, key)
+	}
+	return cmd
 }
 
 func (c *Client) SRem(ctx context.Context, key string, members ...interface{}) *redis.IntCmd {
-	return c.redisClient.SRem(ctx, key, members...)
+	cmd := c.redisClient.SRem(ctx, key, members...)
+	if c.refreshOnAuthError(ctx, cmd.Err()) {
+		cmd = c.redisClient.SRem(ctx, key, members...)
+	}
+	return cmd
 }
 
 func (c *Client) TTL(ctx context.Context, key string) *redis.DurationCmd {

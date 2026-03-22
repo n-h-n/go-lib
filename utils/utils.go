@@ -1136,17 +1136,36 @@ func (l *localLockWrapper) Unlock(ctx context.Context) error {
 	return nil
 }
 
-// redisLockWrapper wraps rlock.Mutex for Redis-based distributed locking
+// redisLockWrapper rebuilds the mutex on each operation so long-lived pods pick
+// up the latest Redis client after an ElastiCache credential refresh.
 type redisLockWrapper struct {
-	mtx rlock.Mutex
+	elasticacheClient *elasticache.Client
+	keyspace          string
+	appID             string
+	verboseMode       bool
+	opts              []rlock.MutexOpt
 }
 
 func (l *redisLockWrapper) Lock(ctx context.Context) error {
-	return l.mtx.Lock(ctx)
+	if l == nil || l.elasticacheClient == nil {
+		return nil
+	}
+	client := l.elasticacheClient.GetRedisClient()
+	if client == nil {
+		return nil
+	}
+	return rlock.NewMutex(client, l.keyspace, l.appID, l.opts...).Lock(ctx)
 }
 
 func (l *redisLockWrapper) Unlock(ctx context.Context) error {
-	return l.mtx.Unlock(ctx)
+	if l == nil || l.elasticacheClient == nil {
+		return nil
+	}
+	client := l.elasticacheClient.GetRedisClient()
+	if client == nil {
+		return nil
+	}
+	return rlock.NewMutex(client, l.keyspace, l.appID, l.opts...).Unlock(ctx)
 }
 
 // NewDistributedLock creates a distributed lock based on available resources.
@@ -1168,8 +1187,13 @@ func NewDistributedLock(
 			if verboseMode {
 				rlockOpts = append(rlockOpts, rlock.WithVerbose())
 			}
-			mtx := rlock.NewMutex(client, keyspace, appID, rlockOpts...)
-			return &redisLockWrapper{mtx: mtx}
+			return &redisLockWrapper{
+				elasticacheClient: elasticacheClient,
+				keyspace:          keyspace,
+				appID:             appID,
+				verboseMode:       verboseMode,
+				opts:              rlockOpts,
+			}
 		}
 	}
 
