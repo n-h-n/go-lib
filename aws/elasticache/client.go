@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,16 +23,16 @@ type Client struct {
 	iamClient          iam.IAMClient
 	replicationGroupID string
 	token              string
-	clientConnectedAt  time.Time
 	clusterMode        bool
 	verboseMode        bool
 	ctx                context.Context
+	mu                 sync.RWMutex
+	refreshMu          sync.Mutex
 }
 
-// ElastiCache IAM auth tokens expire after ~15 minutes. Refresh the client
-// ahead of that window so long-lived pods do not keep using stale credentials
-// and suddenly fail on the next Redis reconnect.
-const proactiveClientRefreshAfter = 12 * time.Minute
+// ElastiCache IAM auth tokens expire after ~15 minutes. Recycle pooled Redis
+// connections ahead of that window so reconnects always fetch fresh IAM auth.
+const proactiveConnectionRotationAfter = 12 * time.Minute
 
 func NewClient(ctx context.Context, replicationGroupID string, verboseMode bool, clientOptions ...clientOpt) (*Client, error) {
 	c := &Client{
@@ -56,9 +57,6 @@ func NewClient(ctx context.Context, replicationGroupID string, verboseMode bool,
 	if c.redisClient == nil {
 		return nil, fmt.Errorf("redis client cannot be nil, please provide a redis client")
 	}
-	if c.clientConnectedAt.IsZero() {
-		c.clientConnectedAt = time.Now()
-	}
 
 	if err := c.writeTokenToLocalFile(); err != nil {
 		log.Log.Errorf(c.ctx, "failed to write elasticache token to local file: %v", err)
@@ -70,20 +68,14 @@ func NewClient(ctx context.Context, replicationGroupID string, verboseMode bool,
 }
 
 func (c *Client) newDefaultRedisClient(redisURI string) (redis.UniversalClient, error) {
-	token, err := c.generateIAMAuthToken()
-	c.token = token
-	if err != nil {
-		return nil, err
-	}
-
 	redisClient := redis.NewClient(&redis.Options{
-		Addr:      redisURI,
-		Username:  c.iamClient.GetServiceName(),
-		Password:  token,
-		TLSConfig: &tls.Config{},
+		Addr:                       redisURI,
+		CredentialsProviderContext: c.redisCredentialsProvider,
+		ConnMaxLifetime:            proactiveConnectionRotationAfter,
+		TLSConfig:                  &tls.Config{},
 	})
 
-	_, err = redisClient.Ping(context.Background()).Result()
+	_, err := redisClient.Ping(context.Background()).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -91,19 +83,14 @@ func (c *Client) newDefaultRedisClient(redisURI string) (redis.UniversalClient, 
 }
 
 func (c *Client) newDefaultRedisClusterClient(redisURI []string) (redis.UniversalClient, error) {
-	token, err := c.generateIAMAuthToken()
-	if err != nil {
-		return nil, err
-	}
-	c.token = token
 	redisClient := redis.NewClusterClient(&redis.ClusterOptions{
-		Addrs:     redisURI,
-		Username:  c.iamClient.GetServiceName(),
-		Password:  token,
-		TLSConfig: &tls.Config{},
+		Addrs:                      redisURI,
+		CredentialsProviderContext: c.redisCredentialsProvider,
+		ConnMaxLifetime:            proactiveConnectionRotationAfter,
+		TLSConfig:                  &tls.Config{},
 	})
 
-	_, err = redisClient.Ping(context.Background()).Result()
+	_, err := redisClient.Ping(context.Background()).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -112,49 +99,12 @@ func (c *Client) newDefaultRedisClusterClient(redisURI []string) (redis.Universa
 }
 
 func (c *Client) refreshRedisClient(force bool) error {
-	forceDueToConnectionAge := !c.clientConnectedAt.IsZero() && time.Since(c.clientConnectedAt) >= proactiveClientRefreshAfter
-	if !force && !forceDueToConnectionAge &&
-		c.iamClient.GetSessionTimeRemaining().Seconds() > c.iamClient.GetSessionDuration().Seconds()*c.iamClient.GetRefreshPercentage() {
-		if c.verboseMode {
-			log.Log.Debugf(c.ctx, "redis client: session time remaining is %v, refreshing at threshold in %v",
-				c.iamClient.GetSessionTimeRemaining(),
-				c.iamClient.GetSessionTimeRemaining()-time.Duration(c.iamClient.GetSessionDuration().Seconds()*c.iamClient.GetRefreshPercentage())*time.Second,
-			)
-		}
-		return nil
-	}
-	if forceDueToConnectionAge {
-		log.Log.Infof(c.ctx, "forcing redis client refresh after %s connection age", proactiveClientRefreshAfter)
-	}
-
 	if c.verboseMode {
 		log.Log.Debugf(c.ctx, "refreshing redis client....")
 	}
 
-	if err := c.iamClient.RefreshAWSCreds(c.ctx); err != nil {
+	if _, err := c.prepareAuthToken(c.ctx, force); err != nil {
 		return err
-	}
-
-	if c.clusterMode {
-		newClient, newClientErr := c.newDefaultRedisClusterClient(c.redisURI)
-
-		if newClientErr != nil {
-			log.Log.Errorf(c.ctx, "while refreshing redis creds, failed to create new redis cluster client: %v", newClientErr)
-			return newClientErr
-		}
-
-		c.redisClient = newClient
-		c.clientConnectedAt = time.Now()
-	} else {
-		newClient, newClientErr := c.newDefaultRedisClient(c.redisURI[0])
-
-		if newClientErr != nil {
-			log.Log.Errorf(c.ctx, "while refreshing redis creds, failed to create new redis client: %v", newClientErr)
-			return newClientErr
-		}
-
-		c.redisClient = newClient
-		c.clientConnectedAt = time.Now()
 	}
 
 	pingResp, err := c.Ping(c.ctx).Result()
@@ -168,7 +118,6 @@ func (c *Client) refreshRedisClient(force bool) error {
 		return err
 	}
 
-	// }
 	if c.verboseMode {
 		log.Log.Debugf(c.ctx, "ping resp: %v", pingResp)
 	}
@@ -222,14 +171,54 @@ func (c *Client) generateIAMAuthToken() (string, error) {
 	return tokenRequest.toSignedRequestURI(creds)
 }
 
+func (c *Client) prepareAuthToken(ctx context.Context, force bool) (string, error) {
+	if ctx == nil {
+		ctx = c.ctx
+	}
+
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+
+	refreshOpts := []func(*iam.RefreshOpts){}
+	if force {
+		refreshOpts = append(refreshOpts, iam.WithForceRefresh(true))
+	}
+	if err := c.iamClient.RefreshAWSCreds(ctx, refreshOpts...); err != nil {
+		return "", err
+	}
+
+	token, err := c.generateIAMAuthToken()
+	if err != nil {
+		return "", err
+	}
+
+	c.mu.Lock()
+	c.token = token
+	c.mu.Unlock()
+
+	return token, nil
+}
+
+func (c *Client) redisCredentialsProvider(ctx context.Context) (string, string, error) {
+	token, err := c.prepareAuthToken(ctx, false)
+	if err != nil {
+		return "", "", err
+	}
+	return c.iamClient.GetServiceName(), token, nil
+}
+
 func (c *Client) writeTokenToLocalFile() error {
+	c.mu.RLock()
+	token := c.token
+	c.mu.RUnlock()
+
 	tokenFile, err := os.Create("./elasticache-token.txt")
 	if err != nil {
 		return err
 	}
 	defer tokenFile.Close()
 
-	_, err = tokenFile.WriteString(c.token)
+	_, err = tokenFile.WriteString(token)
 	if err != nil {
 		return err
 	}
@@ -269,6 +258,8 @@ func (c *Client) Get(ctx context.Context, key string) *redis.StringCmd {
 }
 
 func (c *Client) GetRedisClient() redis.UniversalClient {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.redisClient
 }
 
