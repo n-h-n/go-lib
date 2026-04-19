@@ -47,8 +47,12 @@ func GinRateLimiterMiddleware(
 	}
 
 	return func(c *gin.Context) {
-		// log endpoint and client ip
-		log.Log.Infof(c.Request.Context(), "http request received: endpoint: %s, client ip: %s", c.Request.URL.Path, c.ClientIP())
+		// Per-request access log. Kept at DEBUG because every
+		// request hits this middleware — at INFO it drowns out
+		// meaningful signal (liveness probes, internal health
+		// checks, dashboards polling, etc.). Bump the logger
+		// level to debug/verbose to see these.
+		log.Log.Debugf(c.Request.Context(), "http request received: endpoint: %s, client ip: %s", c.Request.URL.Path, c.ClientIP())
 
 		// Skip rate limit check for specified endpoints
 		for _, endpoint := range o.endpointsToSkipRLCheck {
