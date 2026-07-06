@@ -27,6 +27,9 @@ type Client struct {
 	reindexCollections bool
 	uri                string
 	verboseMode        bool
+	useSCRAMAuth       bool
+	scramUsername      string
+	scramPassword      string
 }
 
 // Credential stores the username and password needed to connect to MongoDB.
@@ -62,20 +65,33 @@ func NewClient(
 		}
 	}
 
-	// Mongo IAM Mode
-	if c.verboseMode {
-		log.Log.Debugf(ctx, "using IAM mode for MongoDB client")
-	}
-	if c.iamClient == nil {
-		defaultIAMClient, err := iam.NewIAMClient(ctx, iam.WithVerboseMode(c.verboseMode))
-		if err != nil {
-			return nil, err
+	if c.useSCRAMAuth {
+		if c.verboseMode {
+			log.Log.Debugf(ctx, "using SCRAM auth for MongoDB client")
 		}
-		c.iamClient = defaultIAMClient
+		mongoClientOptions.SetAuth(options.Credential{
+			AuthMechanism: "SCRAM-SHA-256",
+			AuthSource:    "admin",
+			Username:      c.scramUsername,
+			Password:      c.scramPassword,
+		})
+	} else {
+		// Mongo IAM Mode
+		if c.verboseMode {
+			log.Log.Debugf(ctx, "using IAM mode for MongoDB client")
+		}
+		if c.iamClient == nil {
+			defaultIAMClient, err := iam.NewIAMClient(ctx, iam.WithVerboseMode(c.verboseMode))
+			if err != nil {
+				return nil, err
+			}
+			c.iamClient = defaultIAMClient
+		}
+
+		mongoCredentials := c.getAssumedRoleMongoCredentials(ctx)
+		mongoClientOptions.SetAuth(*mongoCredentials)
 	}
 
-	mongoCredentials := c.getAssumedRoleMongoCredentials(ctx)
-	mongoClientOptions.SetAuth(*mongoCredentials)
 	mongoClient, err := connectMongoClient(ctx, c.verboseMode, mongoClientOptions)
 	if err != nil {
 		return nil, err
@@ -83,7 +99,9 @@ func NewClient(
 
 	c.mongoClient = mongoClient
 
-	go c.runPeriodicAuthRefresh()
+	if !c.useSCRAMAuth {
+		go c.runPeriodicAuthRefresh()
+	}
 	return c, nil
 }
 

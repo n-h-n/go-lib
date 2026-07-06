@@ -37,3 +37,17 @@ func WithReindexCollections(v bool) mongoClientOpt {
 		return nil
 	}
 }
+
+// WithSCRAMCredentials authenticates with a static username/password instead of AWS IAM.
+// Used on Atlas tiers that do not support MONGODB-AWS auth (e.g. M0 dev clusters).
+func WithSCRAMCredentials(username, password string) mongoClientOpt {
+	return func(c *Client) error {
+		if username == "" || password == "" {
+			return errors.New("username and password in WithSCRAMCredentials cannot be empty")
+		}
+		c.useSCRAMAuth = true
+		c.scramUsername = username
+		c.scramPassword = password
+		return nil
+	}
+}
