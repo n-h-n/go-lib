@@ -22,10 +22,12 @@ type Client struct {
 	ctx             context.Context
 	dbClient        *sql.DB
 	dbName          string
-	hostURI         string
+	hostURI         string // Canonical RDS hostname (IAM auth token signing)
+	dialHost        string // Optional TCP dial host override (e.g. 127.0.0.1 for SSM tunnel)
+	dialPort        int    // Optional TCP dial port override (e.g. local forward port)
 	iamClient       iam.IAMClient
 	password        string // Used for password-based authentication (e.g., GCP Cloud SQL)
-	port            int
+	port            int    // Canonical RDS port (IAM auth token signing)
 	region          string
 	sslCertFilePath string
 	sslMode         string
@@ -36,7 +38,7 @@ type Client struct {
 func NewClient(
 	ctx context.Context,
 	hostURI string,
-	opts ...clientOpt,
+	opts ...ClientOpt,
 ) (*Client, error) {
 	c := Client{
 		ctx:         ctx,
@@ -107,7 +109,7 @@ func NewClient(
 		}
 	}
 
-	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s", c.hostURI, c.port, c.user, authToken, c.dbName, c.sslMode)
+	dsn := c.buildDSN(authToken)
 
 	if c.sslMode != "disable" {
 		if c.sslCertFilePath == "" {
@@ -131,7 +133,8 @@ func NewClient(
 	}
 
 	if c.verboseMode {
-		log.Log.Debugf(ctx, "connecting to DB: %s:%d, db=%s, with sslmode=%s and sslCertFilePath=%s", c.hostURI, c.port, c.dbName, c.sslMode, c.sslCertFilePath)
+		dialHost, dialPort := c.dialTarget()
+		log.Log.Debugf(ctx, "connecting to DB: dial=%s:%d (canonical=%s:%d), db=%s, sslmode=%s", dialHost, dialPort, c.hostURI, c.port, c.dbName, c.sslMode)
 	}
 
 	db, err := sql.Open("postgres", dsn)
@@ -236,9 +239,8 @@ func (c *Client) refreshDBClient() error {
 		return err
 	}
 
-	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s", c.hostURI, c.port, c.user, authToken, c.dbName, c.sslMode)
-
-	if c.sslMode != "disable" {
+	dsn := c.buildDSN(authToken)
+	if c.sslMode != "disable" && c.sslCertFilePath != "" {
 		dsn += fmt.Sprintf(" sslrootcert=%s", c.sslCertFilePath)
 	}
 
@@ -293,6 +295,49 @@ func (c *Client) runPeriodicRefresh() {
 	}
 }
 
+func (c *Client) dialTarget() (host string, port int) {
+	host = c.hostURI
+	port = c.port
+	if c.dialHost != "" {
+		host = c.dialHost
+	}
+	if c.dialPort > 0 {
+		port = c.dialPort
+	}
+	return host, port
+}
+
+// buildDSN uses dialHost/dialPort for TCP when set (SSM tunnel), while IAM
+// tokens are always signed against the canonical hostURI:port.
+func (c *Client) buildDSN(password string) string {
+	host, port := c.dialTarget()
+	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s", host, port, c.user, password, c.dbName, c.sslMode)
+}
+
 func (c *Client) Close() error {
 	return c.dbClient.Close()
+}
+
+// DB returns the underlying *sql.DB for callers that need SELECT/custom SQL.
+// Prefer UpsertRows/DeleteRows/AlignTableSchema for schema-aligned writes.
+func (c *Client) DB() *sql.DB {
+	if c == nil {
+		return nil
+	}
+	return c.dbClient
+}
+
+// ExecContext runs a statement on the underlying DB.
+func (c *Client) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return c.dbClient.ExecContext(ctx, query, args...)
+}
+
+// QueryContext runs a query on the underlying DB.
+func (c *Client) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return c.dbClient.QueryContext(ctx, query, args...)
+}
+
+// QueryRowContext runs a query that returns at most one row.
+func (c *Client) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return c.dbClient.QueryRowContext(ctx, query, args...)
 }

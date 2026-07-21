@@ -839,47 +839,31 @@ func (c *Client) GrantTablePermissions(
 	user string,
 	permissions []string,
 ) error {
-	if tableName == "" {
-		return fmt.Errorf("unable to grant permissions: table name cannot be empty")
+	tableQ, err := quoteIdent(tableName)
+	if err != nil {
+		return fmt.Errorf("unable to grant permissions: %w", err)
 	}
-	if user == "" {
-		return fmt.Errorf("unable to grant permissions: user cannot be empty")
+	userQ, err := quoteIdent(user)
+	if err != nil {
+		return fmt.Errorf("unable to grant permissions: %w", err)
 	}
-	if len(permissions) == 0 {
-		return fmt.Errorf("unable to grant permissions: no permissions specified")
-	}
-
-	// Validate permissions
-	validPerms := map[string]bool{
-		"SELECT":     true,
-		"INSERT":     true,
-		"UPDATE":     true,
-		"DELETE":     true,
-		"TRUNCATE":   true,
-		"REFERENCES": true,
-		"TRIGGER":    true,
-		"ALL":        true,
-	}
-
-	for _, perm := range permissions {
-		if !validPerms[strings.ToUpper(perm)] {
-			return fmt.Errorf("invalid permission: %s", perm)
-		}
+	perms, err := normalizePrivileges(permissions, validTablePrivileges)
+	if err != nil {
+		return fmt.Errorf("unable to grant permissions: %w", err)
 	}
 
 	query := fmt.Sprintf(
 		"GRANT %s ON TABLE %s TO %s",
-		strings.Join(permissions, ", "),
-		tableName,
-		user,
+		strings.Join(perms, ", "),
+		tableQ,
+		userQ,
 	)
 
 	if c.verboseMode {
 		log.Log.Debugf(c.ctx, "granting permissions on table %s to user %s with query: %s", tableName, user, query)
 	}
 
-	_, err := c.dbClient.Exec(query)
-	if err != nil {
+	if _, err := c.dbClient.Exec(query); err != nil {
 		return fmt.Errorf("could not grant permissions: %w", err)
 	}
 
