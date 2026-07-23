@@ -69,11 +69,13 @@ func NewClient(
 		if c.verboseMode {
 			log.Log.Debugf(ctx, "using SCRAM auth for MongoDB client")
 		}
+		// Omit AuthMechanism so the driver negotiates SCRAM-SHA-1 / SCRAM-SHA-256.
+		// Forcing SCRAM-SHA-256 fails against Atlas users that only advertise SHA-1
+		// (common on M0), surfacing as a generic "bad auth" handshake error.
 		mongoClientOptions.SetAuth(options.Credential{
-			AuthMechanism: "SCRAM-SHA-256",
-			AuthSource:    "admin",
-			Username:      c.scramUsername,
-			Password:      c.scramPassword,
+			AuthSource: "admin",
+			Username:   c.scramUsername,
+			Password:   c.scramPassword,
 		})
 	} else {
 		// Mongo IAM Mode
