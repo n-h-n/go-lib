@@ -244,7 +244,9 @@ func (c *Client) writeTokenToLocalFile() error {
 	token := c.token
 	c.mu.RUnlock()
 
-	tokenFile, err := os.Create("./elasticache-token.txt")
+	// Distroless / nonroot workloads cannot create files in cwd (often "/").
+	// /tmp is writable in those images and is enough for local debugging.
+	tokenFile, err := os.Create("/tmp/elasticache-token.txt")
 	if err != nil {
 		return err
 	}

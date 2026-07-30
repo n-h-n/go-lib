@@ -161,11 +161,12 @@ func (l *distributedLimiter) allow(ctx context.Context, retried bool) bool {
 		return false
 	}
 
-	if res.Remaining == 0 {
-		return false
-	}
-
-	return true
+	// Allowed is the number of tokens granted for this call. Remaining==0 after
+	// a successful grant just means the bucket is now empty — the request that
+	// emptied it must still pass. Checking Remaining here falsely 429'd the
+	// final request of every window (and doubled under the middleware's two
+	// keys: IP+UA and IP).
+	return res.Allowed > 0
 }
 
 func (l *distributedLimiter) allowN(
