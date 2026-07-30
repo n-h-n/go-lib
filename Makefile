@@ -1,5 +1,5 @@
 PROJECT_NAME = go-lib
-GO_VERSION = go1.25.1
+GO_VERSION = go1.26.5
 export CGO_ENABLED = 0
 GO_FILES = $$( find . -type f -name '*.go' )
 

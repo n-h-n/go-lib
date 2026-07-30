@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
@@ -161,14 +162,45 @@ func (c *Client) generateIAMAuthToken() (string, error) {
 		region:             c.iamClient.GetAWSRegion(),
 	}
 
-	// Use original credentials (pod identity) for ElastiCache IAM auth
-	// ElastiCache IAM authentication requires credentials that match the ElastiCache user
-	// When a role assumes itself, the assumed role credentials don't map correctly to ElastiCache users
-	// The original credentials are refreshed alongside the assumed role credentials in RefreshAWSCreds
-	// See: https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/auth-iam.html
-	creds := c.iamClient.GetOriginalCredentials()
-
+	creds := c.elasticacheSigningCredentials()
 	return tokenRequest.toSignedRequestURI(creds)
+}
+
+// elasticacheSigningCredentials picks the IAM creds that must sign the
+// ElastiCache IAM auth token. The ElastiCache user name (e.g. "daemon") must
+// match the signing principal's role name, and that principal needs
+// elasticache:Connect.
+//
+//   - EKS Pod Identity / IRSA: the default chain already yields the service
+//     role. NewIAMClient then self-assumes for other AWS APIs; the chained
+//     session ARN does not map to the ElastiCache IAM user, so sign with the
+//     original (pre-assume) credentials.
+//   - k3s: the default chain is the node instance profile (e.g. dev-k3s), which
+//     has no elasticache:Connect. Sign with the assumed service-role session.
+func (c *Client) elasticacheSigningCredentials() aws.Credentials {
+	if baseIdentityIsServiceRole() {
+		return c.iamClient.GetOriginalCredentials()
+	}
+	stsCreds := c.iamClient.GetAssumedRole().Credentials
+	return aws.Credentials{
+		AccessKeyID:     *stsCreds.AccessKeyId,
+		SecretAccessKey: *stsCreds.SecretAccessKey,
+		SessionToken:    *stsCreds.SessionToken,
+		CanExpire:       true,
+		Expires:         *stsCreds.Expiration,
+	}
+}
+
+func baseIdentityIsServiceRole() bool {
+	// IRSA
+	if os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE") != "" {
+		return true
+	}
+	// EKS Pod Identity (and other container credential providers)
+	if os.Getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI") != "" {
+		return true
+	}
+	return false
 }
 
 func (c *Client) prepareAuthToken(ctx context.Context, force bool) (string, error) {

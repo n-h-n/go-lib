@@ -80,7 +80,7 @@ __text_normal = \033[0m
 __text_bold = \033[1m
 
 # SOURCE: https://github.com/n-h-n/forge/blob/main/internal/component/data/forge
-FORGE_VERSION ?= v3.29.0
+FORGE_VERSION ?= v1.1.0
 ifeq ($(FORGE_VERSION),)
   $(error FORGE_VERSION variable not set)
 endif
@@ -121,7 +121,7 @@ $(__forge_marker): .d.gh
 	touch $@
 
 # SOURCE: https://github.com/n-h-n/forge/blob/main/internal/component/data/go
-GO_VERSION ?= go1.25.1
+GO_VERSION ?= go1.26.5
 GO = env GOENV=$(GO_ENV) GOROOT=$(GO_ROOT) $(GO_ROOT)/bin/go
 go_dep_loc = $(shell $(GO) mod download $(1) && $(GO) list -m -f "{{.Dir}}" $(1))
 go_nhn_dep_loc = $(call go_dep_loc,github.com/n-h-n/$(1))
@@ -238,28 +238,20 @@ $(__snyk_bin):
 
 
 # SOURCE: https://github.com/n-h-n/forge/blob/main/internal/component/data/semgrep
-SEMGREP_VERSION ?= 1.75.0
+SEMGREP_VERSION ?= 1.138.0
 SEMGREP = $(realpath $(__semgrep_bin))
 __semgrep_dir = $(TOOLS_DIR)/semgrep/$(SEMGREP_VERSION)
-__semgrep_bin = $(__semgrep_dir)/semgrep
-__semgrep_kernel = $(shell uname -s | tr "[:upper:]" "[:lower:]")
-__semgrep_arch = $(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
-__semgrep_file = semgrep-$(SEMGREP_VERSION)-$(__semgrep_kernel)-$(__semgrep_arch)
-__semgrep_base_url = https://github.com/returntocorp/semgrep/releases/download/v$(SEMGREP_VERSION)
-__semgrep_bin_url = $(__semgrep_base_url)/$(__semgrep_file)
-__semgrep_checksum_url = $(__semgrep_base_url)/checksums.txt
-.d.semgrep: $(__semgrep_bin)
+__semgrep_bin = $(__semgrep_dir)/bin/semgrep
+__semgrep_venv = $(__semgrep_dir)/venv
+.d.semgrep: $(__semgrep_bin) | .d.python
 .PHONY: .d.semgrep
-$(__semgrep_bin):
-	rm -f $(GLOBAL_TMP_DIR)/$(__semgrep_file) $(GLOBAL_TMP_DIR)/checksums.txt
-	curl -s -L -o $(GLOBAL_TMP_DIR)/$(__semgrep_file) $(__semgrep_bin_url)
-	curl -s -L -o $(GLOBAL_TMP_DIR)/checksums.txt $(__semgrep_checksum_url)
-	cd $(GLOBAL_TMP_DIR) && grep -F $(__semgrep_file) checksums.txt | $(SHA256SUM) -c -
-	chmod u+x $(GLOBAL_TMP_DIR)/$(__semgrep_file)
-	rm -rf $(__semgrep_dir)
-	mkdir -p $(__semgrep_dir)
-	cp $(GLOBAL_TMP_DIR)/$(__semgrep_file) $@
-	rm $(GLOBAL_TMP_DIR)/$(__semgrep_file) $(GLOBAL_TMP_DIR)/checksums.txt
+$(__semgrep_bin): | $(__semgrep_venv)
+	mkdir -p $(__semgrep_dir)/bin
+	$(__semgrep_venv)/bin/pip install semgrep==$(SEMGREP_VERSION)
+	ln -sf $(realpath $(__semgrep_venv))/bin/semgrep $@
+$(__semgrep_venv):
+	$(PYTHON) -m venv $(__semgrep_venv)
+	$(__semgrep_venv)/bin/pip install --upgrade pip
 
 
 # SOURCE: https://github.com/n-h-n/forge/blob/main/internal/component/data/goimports
@@ -281,36 +273,16 @@ $(__goimports_bin): | .d.go
 
 
 # SOURCE: https://github.com/n-h-n/forge/blob/main/internal/component/data/python
-PYTHON_VERSION ?= 3.12.7
-PYTHON = $(realpath $(__python_bin))
-__python_dir = $(TOOLS_DIR)/python/$(PYTHON_VERSION)
-__python_bin = $(__python_dir)/bin/python
-__python_kernel = $(shell uname -s | tr "[:upper:]" "[:lower:]")
-__python_arch = $(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
-__python_file = Python-$(PYTHON_VERSION).tgz
-__python_base_url = https://www.python.org/ftp/python/$(PYTHON_VERSION)
-__python_bin_url = $(__python_base_url)/$(__python_file)
-__python_checksum_url = $(__python_base_url)/Python-$(PYTHON_VERSION).tgz.sha256
-.d.python: $(__python_bin)
+PYTHON_VERSION ?= system
+PYTHON = $(shell which python3)
+.d.python:
+	@echo "Using system Python: $(PYTHON)"
+	@$(PYTHON) --version
 .PHONY: .d.python
-$(__python_bin):
-	rm -f $(GLOBAL_TMP_DIR)/$(__python_file) $(GLOBAL_TMP_DIR)/$(__python_file).sha256
-	curl -s -L -o $(GLOBAL_TMP_DIR)/$(__python_file) $(__python_bin_url)
-	curl -s -L -o $(GLOBAL_TMP_DIR)/Python-$(PYTHON_VERSION).tgz.sha256 $(__python_checksum_url)
-	cd $(GLOBAL_TMP_DIR) && grep -F $(__python_file) Python-$(PYTHON_VERSION).tgz.sha256 | $(SHA256SUM) -c -
-	rm -rf $(GLOBAL_TMP_DIR)/pythontmp
-	mkdir -p $(GLOBAL_TMP_DIR)/pythontmp
-	tar -xzf $(GLOBAL_TMP_DIR)/$(__python_file) -C $(GLOBAL_TMP_DIR)/pythontmp
-	rm -rf $(__python_dir)
-	mkdir -p $(__python_dir)
-	cd $(GLOBAL_TMP_DIR)/pythontmp/Python-$(PYTHON_VERSION) && \
-		./configure --prefix=$(realpath $(__python_dir)) --enable-optimizations && \
-		make -j$(shell nproc) && make install
-	rm -rf $(GLOBAL_TMP_DIR)/pythontmp $(GLOBAL_TMP_DIR)/$(__python_file)
 
 
 # SOURCE: https://github.com/n-h-n/forge/blob/main/internal/component/data/nodejs
-NODEJS_VERSION ?= v20.18.0
+NODEJS_VERSION ?= v26.4.0
 NODE = $(realpath $(__nodejs_bin))
 __nodejs_dir = $(TOOLS_DIR)/nodejs/$(NODEJS_VERSION)
 __nodejs_bin = $(__nodejs_dir)/bin/node
@@ -334,7 +306,7 @@ $(__nodejs_bin):
 
 
 # SOURCE: https://github.com/n-h-n/forge/blob/main/internal/component/data/npm
-NPM_VERSION ?= 10.8.2
+NPM_VERSION ?= 11.17.0
 NPM = $(realpath $(__npm_bin))
 __npm_dir = $(TOOLS_DIR)/npm/$(NPM_VERSION)
 __npm_bin = $(__npm_dir)/bin/npm
@@ -342,15 +314,20 @@ __npm_kernel = $(shell uname -s | tr "[:upper:]" "[:lower:]")
 __npm_arch = $(shell uname -m | sed -e 's/x86_64/x64/' -e 's/aarch64/arm64/')
 __npm_file = npm-$(NPM_VERSION).tgz
 __npm_base_url = https://registry.npmjs.org/npm/-/npm-$(NPM_VERSION).tgz
+__npm_tgz = $(abspath $(GLOBAL_TMP_DIR)/$(__npm_file))
+__npm_unpack = $(GLOBAL_TMP_DIR)/npm-unpack-$(NPM_VERSION)
 .d.npm: $(__npm_bin) | .d.nodejs
 .PHONY: .d.npm
 $(__npm_bin): | .d.nodejs
-	rm -f $(GLOBAL_TMP_DIR)/$(__npm_file)
-	curl -s -L -o $(GLOBAL_TMP_DIR)/$(__npm_file) $(__npm_base_url)
+	rm -f $(__npm_tgz)
+	curl -s -L -o $(__npm_tgz) $(__npm_base_url)
+	rm -rf $(__npm_unpack)
+	mkdir -p $(__npm_unpack)
+	tar -xzf $(__npm_tgz) -C $(__npm_unpack)
 	rm -rf $(__npm_dir)
 	mkdir -p $(__npm_dir)
-	cd $(__npm_dir) && $(NODE) $(GLOBAL_TMP_DIR)/$(__npm_file) --prefix=$(realpath $(__npm_dir))
-	rm $(GLOBAL_TMP_DIR)/$(__npm_file)
+	cd $(__npm_unpack)/package && $(NODE) bin/npm-cli.js install -g --prefix=$(abspath $(__npm_dir)) $(__npm_tgz)
+	rm -rf $(__npm_unpack) $(__npm_tgz)
 
 
 # SOURCE: https://github.com/n-h-n/forge/blob/main/internal/component/data/gh

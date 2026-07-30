@@ -7,6 +7,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	ststypes "github.com/aws/aws-sdk-go-v2/service/sts/types"
 
 	"github.com/n-h-n/go-lib/aws/iam"
 )
@@ -15,13 +16,27 @@ type fakeIAMClient struct {
 	serviceName       string
 	region            string
 	originalCreds     aws.Credentials
+	assumedCreds      *ststypes.Credentials
 	sessionDuration   time.Duration
 	refreshPercentage float64
 	refreshForces     []bool
 }
 
 func (f *fakeIAMClient) GetAssumedRole() *sts.AssumeRoleOutput {
-	return nil
+	creds := f.assumedCreds
+	if creds == nil {
+		exp := time.Now().Add(f.sessionDuration)
+		if f.sessionDuration == 0 {
+			exp = time.Now().Add(15 * time.Minute)
+		}
+		creds = &ststypes.Credentials{
+			AccessKeyId:     aws.String(f.originalCreds.AccessKeyID),
+			SecretAccessKey: aws.String(f.originalCreds.SecretAccessKey),
+			SessionToken:    aws.String(f.originalCreds.SessionToken),
+			Expiration:      &exp,
+		}
+	}
+	return &sts.AssumeRoleOutput{Credentials: creds}
 }
 
 func (f *fakeIAMClient) GetAWSConfig() *aws.Config {

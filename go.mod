@@ -1,6 +1,6 @@
 module github.com/n-h-n/go-lib
 
-go 1.25.1
+go 1.26.5
 
 require (
 	cloud.google.com/go/bigquery v1.71.0
