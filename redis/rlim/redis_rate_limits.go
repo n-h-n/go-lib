@@ -20,6 +20,21 @@ func PerSecond(rate, burst int, opts ...func(*redis_rate.Limit)) redis_rate.Limi
 	return l
 }
 
+// PerPeriod is a generic windowed limit (e.g. Mailgun's 500 requests / 10s).
+func PerPeriod(rate, burst int, period time.Duration, opts ...func(*redis_rate.Limit)) redis_rate.Limit {
+	l := redis_rate.Limit{
+		Rate:   rate,
+		Period: period,
+		Burst:  burst,
+	}
+
+	for _, opt := range opts {
+		opt(&l)
+	}
+
+	return l
+}
+
 func PerMinute(rate, burst int) redis_rate.Limit {
 	return redis_rate.Limit{
 		Rate:   rate,
