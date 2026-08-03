@@ -5,7 +5,9 @@ import (
 	"crypto/tls"
 	"fmt"
 	"math/rand"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,9 +28,14 @@ type Client struct {
 	token              string
 	clusterMode        bool
 	verboseMode        bool
-	ctx                context.Context
-	mu                 sync.RWMutex
-	refreshMu          sync.Mutex
+	// dialHost/dialPort override the TCP target (e.g. 127.0.0.1 via SSM
+	// port-forward). IAM tokens still use replicationGroupID; TLS ServerName
+	// stays the canonical host from REDIS_URI so cert verify works on localhost.
+	dialHost  string
+	dialPort  int
+	ctx       context.Context
+	mu        sync.RWMutex
+	refreshMu sync.Mutex
 }
 
 // ElastiCache IAM auth tokens expire after ~15 minutes. Recycle pooled Redis
@@ -69,14 +76,18 @@ func NewClient(ctx context.Context, replicationGroupID string, verboseMode bool,
 }
 
 func (c *Client) newDefaultRedisClient(redisURI string) (redis.UniversalClient, error) {
+	addr, tlsConfig, err := c.redisDial(redisURI)
+	if err != nil {
+		return nil, err
+	}
 	redisClient := redis.NewClient(&redis.Options{
-		Addr:                       redisURI,
+		Addr:                       addr,
 		CredentialsProviderContext: c.redisCredentialsProvider,
 		ConnMaxLifetime:            proactiveConnectionRotationAfter,
-		TLSConfig:                  &tls.Config{},
+		TLSConfig:                  tlsConfig,
 	})
 
-	_, err := redisClient.Ping(context.Background()).Result()
+	_, err = redisClient.Ping(context.Background()).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -84,11 +95,26 @@ func (c *Client) newDefaultRedisClient(redisURI string) (redis.UniversalClient, 
 }
 
 func (c *Client) newDefaultRedisClusterClient(redisURI []string) (redis.UniversalClient, error) {
+	// Dial host/port overrides are for a single-node SSM tunnel (dev Valkey).
+	// Cluster mode discovers node endpoints the laptop cannot reach, so ignore
+	// the override and dial the canonical seeds with TLS ServerName set.
+	addrs := make([]string, len(redisURI))
+	var tlsConfig *tls.Config
+	for i, uri := range redisURI {
+		host, port, err := splitRedisAddr(uri)
+		if err != nil {
+			return nil, err
+		}
+		addrs[i] = net.JoinHostPort(host, strconv.Itoa(port))
+		if tlsConfig == nil {
+			tlsConfig = &tls.Config{ServerName: host}
+		}
+	}
 	redisClient := redis.NewClusterClient(&redis.ClusterOptions{
-		Addrs:                      redisURI,
+		Addrs:                      addrs,
 		CredentialsProviderContext: c.redisCredentialsProvider,
 		ConnMaxLifetime:            proactiveConnectionRotationAfter,
-		TLSConfig:                  &tls.Config{},
+		TLSConfig:                  tlsConfig,
 	})
 
 	_, err := redisClient.Ping(context.Background()).Result()
@@ -97,6 +123,56 @@ func (c *Client) newDefaultRedisClusterClient(redisURI []string) (redis.Universa
 	}
 
 	return redisClient, nil
+}
+
+// redisDial builds the TCP addr and TLS config for a canonical REDIS_URI.
+//
+// REDIS_URI is always the real ElastiCache endpoint (host:port, optional
+// redis(s)://). When dialHost/dialPort are set (SSM tunnel), TCP goes there
+// while TLS ServerName stays the canonical hostname so certificate verification
+// still matches the Valkey cert.
+func (c *Client) redisDial(redisURI string) (addr string, tlsConfig *tls.Config, err error) {
+	host, port, err := splitRedisAddr(redisURI)
+	if err != nil {
+		return "", nil, err
+	}
+	tlsConfig = &tls.Config{ServerName: host}
+
+	dialHost := host
+	dialPort := port
+	if c.dialHost != "" {
+		dialHost = c.dialHost
+	}
+	if c.dialPort > 0 {
+		dialPort = c.dialPort
+	}
+	return net.JoinHostPort(dialHost, strconv.Itoa(dialPort)), tlsConfig, nil
+}
+
+// splitRedisAddr parses host:port from a REDIS_URI that may include a redis://
+// or rediss:// scheme and an optional path.
+func splitRedisAddr(redisURI string) (host string, port int, err error) {
+	uri := strings.TrimSpace(redisURI)
+	if uri == "" {
+		return "", 0, fmt.Errorf("redis URI is empty")
+	}
+	uri = strings.TrimPrefix(uri, "rediss://")
+	uri = strings.TrimPrefix(uri, "redis://")
+	if i := strings.Index(uri, "/"); i >= 0 {
+		uri = uri[:i]
+	}
+	h, p, err := net.SplitHostPort(uri)
+	if err != nil {
+		return "", 0, fmt.Errorf("parse redis URI %q: %w", redisURI, err)
+	}
+	port, err = strconv.Atoi(p)
+	if err != nil {
+		return "", 0, fmt.Errorf("parse redis URI port %q: %w", p, err)
+	}
+	if h == "" || port <= 0 {
+		return "", 0, fmt.Errorf("parse redis URI %q: missing host or port", redisURI)
+	}
+	return h, port, nil
 }
 
 func (c *Client) refreshRedisClient(force bool) error {

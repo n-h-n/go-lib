@@ -144,3 +144,55 @@ func TestRedisCredentialsProviderUsesNonForcedRefresh(t *testing.T) {
 		t.Fatal("expected redisCredentialsProvider to persist token on client")
 	}
 }
+
+func TestSplitRedisAddr(t *testing.T) {
+	t.Parallel()
+
+	host, port, err := splitRedisAddr("master.valkey.example.cache.amazonaws.com:6379")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != "master.valkey.example.cache.amazonaws.com" || port != 6379 {
+		t.Fatalf("got %s:%d", host, port)
+	}
+
+	host, port, err = splitRedisAddr("rediss://master.valkey.example.cache.amazonaws.com:6379/0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != "master.valkey.example.cache.amazonaws.com" || port != 6379 {
+		t.Fatalf("got %s:%d", host, port)
+	}
+
+	if _, _, err := splitRedisAddr(""); err == nil {
+		t.Fatal("expected empty URI to fail")
+	}
+}
+
+func TestRedisDialUsesCanonicalTLSServerName(t *testing.T) {
+	t.Parallel()
+
+	client := &Client{dialHost: "127.0.0.1", dialPort: 16379}
+	addr, tlsConfig, err := client.redisDial("master.valkey.example.cache.amazonaws.com:6379")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr != "127.0.0.1:16379" {
+		t.Fatalf("addr=%q", addr)
+	}
+	if tlsConfig == nil || tlsConfig.ServerName != "master.valkey.example.cache.amazonaws.com" {
+		t.Fatalf("ServerName=%q", tlsConfig.ServerName)
+	}
+
+	direct := &Client{}
+	addr, tlsConfig, err = direct.redisDial("master.valkey.example.cache.amazonaws.com:6379")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr != "master.valkey.example.cache.amazonaws.com:6379" {
+		t.Fatalf("addr=%q", addr)
+	}
+	if tlsConfig.ServerName != "master.valkey.example.cache.amazonaws.com" {
+		t.Fatalf("ServerName=%q", tlsConfig.ServerName)
+	}
+}
