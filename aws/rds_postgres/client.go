@@ -3,16 +3,18 @@ package rds_postgres
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/rds/auth"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 
 	"github.com/n-h-n/go-lib/aws/iam"
 	"github.com/n-h-n/go-lib/log"
@@ -33,6 +35,7 @@ type Client struct {
 	sslMode         string
 	user            string
 	verboseMode     bool
+	mu              sync.Mutex // mintAuthToken vs STS refresh
 }
 
 func NewClient(
@@ -40,7 +43,7 @@ func NewClient(
 	hostURI string,
 	opts ...ClientOpt,
 ) (*Client, error) {
-	c := Client{
+	c := &Client{
 		ctx:         ctx,
 		hostURI:     hostURI,
 		port:        5432,
@@ -49,87 +52,47 @@ func NewClient(
 	}
 
 	for _, opt := range opts {
-		err := opt(&c)
-		if err != nil {
+		if err := opt(c); err != nil {
 			return nil, err
 		}
 	}
 
-	var authToken string
-	var err error
-
-	// Check if using password-based authentication
 	if c.password != "" {
-		// Password-based authentication (e.g., GCP Cloud SQL)
 		if c.user == "" {
 			return nil, fmt.Errorf("user is required when using password authentication")
 		}
 		if c.dbName == "" {
 			c.dbName = c.user
 		}
-		authToken = c.password
 	} else {
-		// IAM-based authentication (AWS RDS)
 		if c.iamClient == nil {
-			// RDS auth tokens are limited to 15 minutes so set session to 15 minutes
+			// STS session matches RDS IAM token lifetime (15 minutes).
 			iamClient, err := iam.NewIAMClient(ctx, iam.WithVerboseMode(c.verboseMode), iam.WithSessionDuration(15*time.Minute))
 			if err != nil {
 				return nil, err
 			}
 			c.iamClient = iamClient
 		}
-
 		if c.user == "" {
 			c.user = c.iamClient.GetServiceName()
 		}
-
 		if c.region == "" {
 			c.region = c.iamClient.GetAWSRegion()
 		}
-
 		if c.dbName == "" {
 			c.dbName = c.user
 		}
+	}
 
-		stsCreds := c.iamClient.GetAssumedRole().Credentials
-		awsCredsProvider := credentials.NewStaticCredentialsProvider(
-			*stsCreds.AccessKeyId,
-			*stsCreds.SecretAccessKey,
-			*stsCreds.SessionToken,
-		)
-		authToken, err = auth.BuildAuthToken(
-			ctx,
-			fmt.Sprintf("%s:%d", c.hostURI, c.port),
-			c.region,
-			c.user,
-			awsCredsProvider,
-		)
+	if c.sslMode != "disable" && c.sslCertFilePath == "" && c.region != "" {
+		if c.verboseMode {
+			log.Log.Debugf(ctx, "sslMode set to %s but no cert filepath specified; downloading SSL root cert from AWS....", c.sslMode)
+		}
+		certFilePath, err := downloadSSLRootCert(c.region)
 		if err != nil {
 			return nil, err
 		}
-	}
-
-	dsn := c.buildDSN(authToken)
-
-	if c.sslMode != "disable" {
-		if c.sslCertFilePath == "" {
-			// Only download AWS cert if region is set (IAM auth) and no cert filepath specified
-			if c.region != "" {
-				if c.verboseMode {
-					log.Log.Debugf(ctx, "sslMode set to %s but no cert filepath specified; downloading SSL root cert from AWS....", c.sslMode)
-				}
-				// download the cert from AWS
-				certFilePath, err := downloadSSLRootCert(c.region)
-				if err != nil {
-					return nil, err
-				}
-				c.sslCertFilePath = certFilePath
-			}
-		}
-
-		if c.sslCertFilePath != "" {
-			dsn += fmt.Sprintf(" sslrootcert=%s", c.sslCertFilePath)
-		}
+		c.sslCertFilePath = certFilePath
 	}
 
 	if c.verboseMode {
@@ -137,13 +100,22 @@ func NewClient(
 		log.Log.Debugf(ctx, "connecting to DB: dial=%s:%d (canonical=%s:%d), db=%s, sslmode=%s", dialHost, dialPort, c.hostURI, c.port, c.dbName, c.sslMode)
 	}
 
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		return nil, err
+	var db *sql.DB
+	if c.password != "" {
+		opened, err := sql.Open("postgres", c.dsnWithSSL(c.password))
+		if err != nil {
+			return nil, err
+		}
+		db = opened
+	} else {
+		// Mint a fresh IAM token on each new physical connection. Do not replace
+		// the *sql.DB — swapping the pool and closing the old one aborts in-flight
+		// COPY/transactions with "sql: database is closed".
+		db = sql.OpenDB(&iamTokenConnector{c: c})
 	}
 
-	err = db.Ping()
-	if err != nil {
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 
@@ -152,13 +124,11 @@ func NewClient(
 		log.Log.Debugf(ctx, "successfully connected to DB")
 	}
 
-	// Only run periodic refresh for IAM-based authentication
-	// Password-based authentication doesn't need token refresh
 	if c.password == "" {
 		go c.runPeriodicRefresh()
 	}
 
-	return &c, nil
+	return c, nil
 }
 
 func downloadSSLRootCert(region string) (string, error) {
@@ -195,84 +165,73 @@ func downloadSSLRootCert(region string) (string, error) {
 }
 
 func (c *Client) refreshDBClient() error {
-	// Skip refresh for password-based authentication
-	if c.password != "" {
+	if c.password != "" || c.iamClient == nil {
 		return nil
 	}
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.iamClient.GetSessionTimeRemaining().Seconds() > c.iamClient.GetSessionDuration().Seconds()*c.iamClient.GetRefreshPercentage() {
-		// Greater than the refreshAtPercentageRemaining of the session duration remaining, no need to refresh
-		if c.verboseMode {
-			log.Log.Debugf(
-				c.ctx,
-				"skipping RDS DB connection refresh, session token time remaining: %v, time remaining until refresh: %v",
-				c.iamClient.GetSessionTimeRemaining(),
-				c.iamClient.GetSessionTimeRemaining()-time.Duration(c.iamClient.GetSessionDuration().Seconds()*c.iamClient.GetRefreshPercentage())*time.Second,
-			)
-		}
 		return nil
 	}
-
 	if c.verboseMode {
-		log.Log.Debugf(c.ctx, "refreshing RDS DB connection")
+		log.Log.Debugf(c.ctx, "refreshing AWS credentials for RDS IAM (sql pool unchanged)")
 	}
+	return c.iamClient.RefreshAWSCreds(c.ctx)
+}
 
-	if err := c.iamClient.RefreshAWSCreds(c.ctx); err != nil {
-		return err
+func (c *Client) mintAuthToken(ctx context.Context) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.iamClient.GetSessionTimeRemaining() < 2*time.Minute {
+		if err := c.iamClient.RefreshAWSCreds(ctx); err != nil {
+			return "", err
+		}
 	}
-
 	stsCreds := c.iamClient.GetAssumedRole().Credentials
 	awsCredsProvider := credentials.NewStaticCredentialsProvider(
 		*stsCreds.AccessKeyId,
 		*stsCreds.SecretAccessKey,
 		*stsCreds.SessionToken,
 	)
-
-	authToken, err := auth.BuildAuthToken(
-		c.ctx,
+	return auth.BuildAuthToken(
+		ctx,
 		fmt.Sprintf("%s:%d", c.hostURI, c.port),
 		c.region,
 		c.user,
 		awsCredsProvider,
 	)
-	if err != nil {
-		return err
-	}
+}
 
-	dsn := c.buildDSN(authToken)
+func (c *Client) dsnWithSSL(password string) string {
+	dsn := c.buildDSN(password)
 	if c.sslMode != "disable" && c.sslCertFilePath != "" {
 		dsn += fmt.Sprintf(" sslrootcert=%s", c.sslCertFilePath)
 	}
+	return dsn
+}
 
-	newDB, err := sql.Open("postgres", dsn)
+// iamTokenConnector opens each new physical Postgres connection with a freshly
+// minted RDS IAM token. Authenticated sessions stay valid after the token
+// expires; only new dials need a new token.
+type iamTokenConnector struct {
+	c *Client
+}
+
+func (ic *iamTokenConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	token, err := ic.c.mintAuthToken(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	err = newDB.Ping()
+	inner, err := pq.NewConnector(ic.c.dsnWithSSL(token))
 	if err != nil {
-		return err
+		return nil, err
 	}
+	return inner.Connect(ctx)
+}
 
-	oldDB := c.dbClient
-	c.dbClient = newDB
-
-	if oldDB != nil {
-		if c.verboseMode {
-			log.Log.Debugf(c.ctx, "closing old RDS DB connection after 2 minutes")
-		}
-		time.AfterFunc(2*time.Minute, func() {
-			if err := oldDB.Close(); err != nil {
-				log.Log.Errorf(c.ctx, "failed to close old RDS DB connection: %v", err)
-			}
-		})
-	}
-
-	if c.verboseMode {
-		log.Log.Debugf(c.ctx, "successfully refreshed RDS DB connection")
-	}
-
-	return nil
+func (ic *iamTokenConnector) Driver() driver.Driver {
+	return pq.Driver{}
 }
 
 func (c *Client) runPeriodicRefresh() {
