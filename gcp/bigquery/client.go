@@ -6,8 +6,11 @@ import (
 	"time"
 
 	"cloud.google.com/go/bigquery"
+	"github.com/n-h-n/go-lib/aws/elasticache"
 	"github.com/n-h-n/go-lib/gcp/iam"
 	"github.com/n-h-n/go-lib/log"
+	"github.com/n-h-n/go-lib/utils"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/option"
 )
@@ -27,6 +30,12 @@ type Client struct {
 	dryRun            bool
 	createDisposition string
 	writeDisposition  string
+
+	rateLimiter       utils.RateLimiter
+	rateConfig        RateConfig
+	useRedisRateLimit bool
+	redisClient       redis.UniversalClient
+	elasticacheClient *elasticache.Client
 }
 
 func NewClient(
@@ -47,6 +56,7 @@ func NewClient(
 		dryRun:            false,
 		createDisposition: "CREATE_IF_NEEDED",
 		writeDisposition:  "WRITE_APPEND",
+		rateConfig:        DefaultRateConfig,
 	}
 
 	for _, opt := range opts {
@@ -89,6 +99,13 @@ func NewClient(
 			log.Log.Debugf(ctx, "using default credentials for BigQuery authentication")
 		}
 	}
+
+	c.rateLimiter = newRateLimiter(
+		c.rateConfig,
+		c.useRedisRateLimit,
+		c.redisClient,
+		c.elasticacheClient,
+	)
 
 	// Create BigQuery client
 	client, err := bigquery.NewClient(ctx, c.projectID, clientOptions...)
@@ -244,6 +261,9 @@ func (c *Client) WaitForJob(ctx context.Context, job *bigquery.Job) error {
 
 // ExecuteQuery executes a BigQuery query and returns the iterator
 func (c *Client) ExecuteQuery(ctx context.Context, query string) (*bigquery.RowIterator, error) {
+	if err := c.waitRateLimit(ctx); err != nil {
+		return nil, err
+	}
 	if c.verboseMode {
 		log.Log.Debugf(ctx, "executing query: %s", query)
 	}
@@ -276,6 +296,9 @@ func (c *Client) ExecuteQuery(ctx context.Context, query string) (*bigquery.RowI
 
 // ExecuteDML executes a DML (Data Manipulation Language) query
 func (c *Client) ExecuteDML(ctx context.Context, query string) error {
+	if err := c.waitRateLimit(ctx); err != nil {
+		return err
+	}
 	if c.verboseMode {
 		log.Log.Debugf(ctx, "executing DML query: %s", query)
 	}
@@ -305,6 +328,9 @@ func (c *Client) ExecuteDML(ctx context.Context, query string) error {
 
 // GetJob retrieves a BigQuery job by ID
 func (c *Client) GetJob(ctx context.Context, jobID string) (*bigquery.Job, error) {
+	if err := c.waitRateLimit(ctx); err != nil {
+		return nil, err
+	}
 	job, err := c.client.JobFromID(ctx, jobID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get job: %w", err)
@@ -325,6 +351,9 @@ func (c *Client) GetJob(ctx context.Context, jobID string) (*bigquery.Job, error
 
 // ListJobs lists BigQuery jobs
 func (c *Client) ListJobs(ctx context.Context, maxResults int) ([]*bigquery.Job, error) {
+	if err := c.waitRateLimit(ctx); err != nil {
+		return nil, err
+	}
 	if maxResults <= 0 {
 		maxResults = 100
 	}

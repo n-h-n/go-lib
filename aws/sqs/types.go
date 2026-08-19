@@ -7,6 +7,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 
+	"github.com/n-h-n/go-lib/aws/awslimit"
 	"github.com/n-h-n/go-lib/aws/iam"
 )
 
@@ -33,12 +34,13 @@ func (mt MessageType) String() string {
 }
 
 type Client struct {
-	mtx         *sync.RWMutex
-	queues      *map[string]*queue
-	iamClient   iam.IAMClient
-	sqsClient   *sqs.Client
-	verboseMode bool
-	ctx         context.Context
+	mtx           *sync.RWMutex
+	queues        *map[string]*queue
+	iamClient     iam.IAMClient
+	sqsClient     *sqs.Client
+	verboseMode   bool
+	ctx           context.Context
+	rateLimitOpts []awslimit.Opt
 }
 
 type queue struct {

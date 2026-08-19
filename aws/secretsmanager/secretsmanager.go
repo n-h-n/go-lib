@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awsSecretsmanager "github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 
+	"github.com/n-h-n/go-lib/aws/awslimit"
 	"github.com/n-h-n/go-lib/aws/iam"
 )
 
@@ -36,7 +37,9 @@ func (f *AWSSecretFetcher) FetchSecret(ctx context.Context, secretKey string) ([
 		return nil, err
 	}
 
-	client := awsSecretsmanager.NewFromConfig(cfg)
+	client := awsSecretsmanager.NewFromConfig(cfg, func(o *awsSecretsmanager.Options) {
+		o.APIOptions = append(o.APIOptions, awslimit.StackOption(awslimit.SecretsManager))
+	})
 
 	input := &awsSecretsmanager.GetSecretValueInput{
 		SecretId: aws.String(secretKey),

@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 
+	"github.com/n-h-n/go-lib/aws/awslimit"
 	"github.com/n-h-n/go-lib/log"
 )
 
@@ -115,7 +116,9 @@ func (c *iamClient) loadDefaultConfig(ctx context.Context) error {
 }
 
 func (c *iamClient) assumeRole(ctx context.Context) error {
-	stsService := sts.NewFromConfig(*c.awsConfig)
+	stsService := sts.NewFromConfig(*c.awsConfig, func(o *sts.Options) {
+		o.APIOptions = append(o.APIOptions, awslimit.StackOption(awslimit.STS))
+	})
 
 	if c.sessionName == "" {
 		c.sessionName = strconv.FormatInt(time.Now().Unix(), 10)

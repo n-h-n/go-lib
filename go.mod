@@ -13,6 +13,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.39.6
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.42.20
 	github.com/aws/aws-sdk-go-v2/service/sts v1.38.6
+	github.com/aws/smithy-go v1.27.3
 	github.com/gin-gonic/gin v1.11.0
 	github.com/go-redis/redis_rate/v10 v10.0.1
 	github.com/google/uuid v1.6.0
@@ -44,7 +45,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.30 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sso v1.29.5 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.1 // indirect
-	github.com/aws/smithy-go v1.27.3 // indirect
 	github.com/bytedance/sonic v1.14.0 // indirect
 	github.com/bytedance/sonic/loader v0.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

@@ -11,7 +11,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/aws/smithy-go/middleware"
 
+	"github.com/n-h-n/go-lib/aws/awslimit"
 	"github.com/n-h-n/go-lib/aws/iam"
 	"github.com/n-h-n/go-lib/log"
 )
@@ -62,7 +64,7 @@ func (c *Client) newSQSClient() error {
 		DefaultsMode:       awsConfig.DefaultsMode,
 		Logger:             awsConfig.Logger,
 		RuntimeEnvironment: awsConfig.RuntimeEnvironment,
-		APIOptions:         awsConfig.APIOptions,
+		APIOptions:         append(append([]func(*middleware.Stack) error{}, awsConfig.APIOptions...), awslimit.StackOption(awslimit.SQS, c.rateLimitOpts...)),
 		ClientLogMode:      awsConfig.ClientLogMode,
 		AppID:              awsConfig.AppID,
 	})

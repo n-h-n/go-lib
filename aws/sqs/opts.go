@@ -1,5 +1,11 @@
 package sqs
 
+import (
+	"github.com/redis/go-redis/v9"
+
+	"github.com/n-h-n/go-lib/aws/awslimit"
+)
+
 type clientOpt func(*Client) error
 type queueOpt func(*queue) error
 type messageOpt func(*mOpt) error
@@ -14,6 +20,26 @@ type mOpt struct {
 func WithVerboseMode(verboseMode bool) clientOpt {
 	return func(c *Client) error {
 		c.verboseMode = verboseMode
+		return nil
+	}
+}
+
+// WithRedisRateLimit uses Valkey for a cluster-wide SQS API budget.
+func WithRedisRateLimit(redisClient redis.UniversalClient, refresh func() redis.UniversalClient) clientOpt {
+	return func(c *Client) error {
+		if redisClient != nil {
+			c.rateLimitOpts = append(c.rateLimitOpts, awslimit.WithRedis(redisClient, refresh))
+		}
+		return nil
+	}
+}
+
+// WithRateLimitKeyPrefix prepends a service name to the SQS limiter key.
+func WithRateLimitKeyPrefix(prefix string) clientOpt {
+	return func(c *Client) error {
+		if prefix != "" {
+			c.rateLimitOpts = append(c.rateLimitOpts, awslimit.WithKeyPrefix(prefix))
+		}
 		return nil
 	}
 }

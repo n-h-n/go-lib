@@ -70,6 +70,9 @@ func (r *rowValueSaver) Save() (map[string]bigquery.Value, string, error) {
 
 // CreateTable creates a BigQuery table
 func (c *Client) CreateTable(table *Table, opts ...func(*createTableOpts)) error {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return err
+	}
 	if table == nil {
 		return fmt.Errorf("unable to create table: table cannot be nil")
 	}
@@ -202,6 +205,9 @@ func (c *Client) CreateTable(table *Table, opts ...func(*createTableOpts)) error
 
 // DropTable drops a BigQuery table
 func (c *Client) DropTable(tableName string) error {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return err
+	}
 	if tableName == "" {
 		return fmt.Errorf("table name cannot be empty")
 	}
@@ -226,6 +232,9 @@ func (c *Client) DropTable(tableName string) error {
 
 // IsTableExistent checks if a table exists
 func (c *Client) IsTableExistent(table *Table) (bool, error) {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return false, err
+	}
 	if table == nil {
 		return false, fmt.Errorf("unable to check if table exists: table cannot be nil")
 	}
@@ -244,6 +253,9 @@ func (c *Client) IsTableExistent(table *Table) (bool, error) {
 
 // GetTableNames returns a list of table names in the dataset
 func (c *Client) GetTableNames() ([]string, error) {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return nil, err
+	}
 	datasetRef := c.GetDatasetReference()
 	it := datasetRef.Tables(c.ctx)
 
@@ -264,6 +276,9 @@ func (c *Client) GetTableNames() ([]string, error) {
 
 // GetTableSchema returns the schema of a table
 func (c *Client) GetTableSchema(tableName string) (*Schema, error) {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return nil, err
+	}
 	// Validate table name
 	if err := validateTableName(tableName); err != nil {
 		return nil, fmt.Errorf("invalid table name: %w", err)
@@ -692,6 +707,9 @@ func (c *Client) HasPrimaryKeyConstraint(tableName string) (bool, error) {
 
 // AddClusteringToTable adds clustering to a table with flexible configuration options
 func (c *Client) AddClusteringToTable(table *Table, opts ...func(*clusteringOpts)) error {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return err
+	}
 	if table == nil {
 		return fmt.Errorf("table cannot be nil")
 	}
@@ -753,6 +771,9 @@ func (c *Client) AddClusteringToTable(table *Table, opts ...func(*clusteringOpts
 
 // HasClustering checks if a table has clustering configured
 func (c *Client) HasClustering(tableName string) (bool, error) {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return false, err
+	}
 	if tableName == "" {
 		return false, fmt.Errorf("table name cannot be empty")
 	}
@@ -882,6 +903,9 @@ func (c *Client) needsTableRecreation(table *Table) (bool, error) {
 
 // AlterTableAddColumns adds columns to an existing table
 func (c *Client) AlterTableAddColumns(table *Table) error {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return err
+	}
 	if c.verboseMode {
 		log.Log.Debugf(c.ctx, "altering table %s in %s", table.Name, c.datasetID)
 	}
@@ -1456,6 +1480,9 @@ func (c *Client) QueryRowsWithCustomUnmarshaling(query string, targetSlice inter
 
 // QueryWithParams executes a parameterized query
 func (c *Client) QueryWithParams(query string, params map[string]interface{}) (*bigquery.RowIterator, error) {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return nil, err
+	}
 	if c.verboseMode {
 		log.Log.Debugf(c.ctx, "executing parameterized query: %s", query)
 		// Debug: show formatted parameter values
@@ -1657,6 +1684,9 @@ func (c *Client) LeftJoin(leftTable *Table, rightTable *Table, joinColumns []Joi
 
 // CreateDataset creates a BigQuery dataset
 func (c *Client) CreateDataset(datasetID string, opts ...func(*createDatasetOpts)) error {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return err
+	}
 	if datasetID == "" {
 		return fmt.Errorf("dataset ID cannot be empty")
 	}
@@ -1718,6 +1748,9 @@ func (c *Client) CreateDataset(datasetID string, opts ...func(*createDatasetOpts
 // This is useful as a workaround for BigQuery's immutable dataset names - you cannot rename
 // a dataset, but you can copy all its tables to a new dataset.
 func (c *Client) CopyDatasetTables(sourceDatasetID, destDatasetID string, opts ...func(*copyDatasetOpts)) error {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return err
+	}
 	if sourceDatasetID == "" {
 		return fmt.Errorf("source dataset ID cannot be empty")
 	}
@@ -1895,6 +1928,9 @@ func (c *Client) CopyDatasetTables(sourceDatasetID, destDatasetID string, opts .
 // CopyTable copies a single table from source to destination.
 // The source and destination can be in different datasets or even different projects.
 func (c *Client) CopyTable(sourceDatasetID, sourceTableName, destDatasetID, destTableName string, opts ...func(*copyTableOpts)) error {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return err
+	}
 	if sourceDatasetID == "" {
 		return fmt.Errorf("source dataset ID cannot be empty")
 	}
@@ -1986,6 +2022,9 @@ func (c *Client) CopyTable(sourceDatasetID, sourceTableName, destDatasetID, dest
 
 // DropDataset drops a BigQuery dataset
 func (c *Client) DropDataset(datasetID string, deleteContents bool) error {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return err
+	}
 	if datasetID == "" {
 		return fmt.Errorf("dataset ID cannot be empty")
 	}
@@ -2010,6 +2049,9 @@ func (c *Client) DropDataset(datasetID string, deleteContents bool) error {
 
 // CreateView creates a BigQuery view
 func (c *Client) CreateView(viewName, query string, replace bool) error {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return err
+	}
 	if viewName == "" {
 		return fmt.Errorf("unable to create view: view name cannot be empty")
 	}
@@ -2067,6 +2109,9 @@ func (c *Client) CreateView(viewName, query string, replace bool) error {
 
 // DropView drops a BigQuery view
 func (c *Client) DropView(viewName string) error {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return err
+	}
 	if viewName == "" {
 		return fmt.Errorf("unable to drop view: view name cannot be empty")
 	}
@@ -2090,6 +2135,9 @@ func (c *Client) DropView(viewName string) error {
 
 // ViewExists checks if a view exists
 func (c *Client) ViewExists(viewName string) (bool, error) {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return false, err
+	}
 	if viewName == "" {
 		return false, fmt.Errorf("unable to check if view exists: view name cannot be empty")
 	}
@@ -2108,6 +2156,9 @@ func (c *Client) ViewExists(viewName string) (bool, error) {
 
 // CreateIndex creates clustering or partitioning for a BigQuery table
 func (c *Client) CreateIndex(table *Table, opts ...func(*indexOpts)) error {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return err
+	}
 	o := indexOpts{
 		recreate:          false,
 		typ:               IndexTypeClustering,
@@ -2336,6 +2387,9 @@ func (c *Client) createVectorIndex(table *Table, config *VectorIndexConfig) erro
 
 // DropIndex drops clustering or partitioning from a BigQuery table
 func (c *Client) DropIndex(table *Table, opts *indexOpts) error {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return err
+	}
 	if table == nil || table.Name == "" {
 		return fmt.Errorf("unable to drop index: table and table.Name cannot be zero values")
 	}
@@ -2406,6 +2460,9 @@ func (c *Client) DropIndex(table *Table, opts *indexOpts) error {
 
 // IsIndexExistent checks if clustering or partitioning exists for a table
 func (c *Client) IsIndexExistent(table *Table, opts *indexOpts) (bool, error) {
+	if err := c.waitRateLimit(c.ctx); err != nil {
+		return false, err
+	}
 	if table == nil || table.Name == "" {
 		return false, fmt.Errorf("unable to check if index exists: table and table.Name cannot be zero values")
 	}

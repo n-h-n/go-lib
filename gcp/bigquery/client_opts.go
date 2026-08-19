@@ -3,7 +3,9 @@ package bigquery
 import (
 	"fmt"
 
+	"github.com/n-h-n/go-lib/aws/elasticache"
 	"github.com/n-h-n/go-lib/gcp/iam"
+	"github.com/redis/go-redis/v9"
 )
 
 type clientOpt func(*Client) error
@@ -111,6 +113,25 @@ func WithAutoIAMFederation(gcpProjectID, gcpProjectNum string, opts ...iam.Optio
 func WithCredentialsJSON(credentialsJSON string) clientOpt {
 	return func(c *Client) error {
 		c.credentialsJSON = credentialsJSON
+		return nil
+	}
+}
+
+// WithRateLimit overrides the default BigQuery API token bucket.
+func WithRateLimit(cfg RateConfig) clientOpt {
+	return func(c *Client) error {
+		c.rateConfig = cfg
+		return nil
+	}
+}
+
+// WithRedisRateLimit uses Valkey/Redis for a cluster-wide BigQuery API budget.
+// When redisClient is nil, the local in-process limiter is used instead.
+func WithRedisRateLimit(redisClient redis.UniversalClient, ec *elasticache.Client) clientOpt {
+	return func(c *Client) error {
+		c.useRedisRateLimit = redisClient != nil
+		c.redisClient = redisClient
+		c.elasticacheClient = ec
 		return nil
 	}
 }

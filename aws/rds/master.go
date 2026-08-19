@@ -14,6 +14,8 @@ import (
 	awsrds "github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+
+	"github.com/n-h-n/go-lib/aws/awslimit"
 )
 
 // MasterCredentials are the RDS master login details plus endpoint metadata.
@@ -59,7 +61,12 @@ func loadConfig(ctx context.Context) (aws.Config, error) {
 	// Cached so the credentials refresh on expiry rather than pinning one
 	// STS response for the process lifetime.
 	cfg.Credentials = aws.NewCredentialsCache(
-		stscreds.NewAssumeRoleProvider(sts.NewFromConfig(cfg), roleARN),
+		stscreds.NewAssumeRoleProvider(
+			sts.NewFromConfig(cfg, func(o *sts.Options) {
+				o.APIOptions = append(o.APIOptions, awslimit.StackOption(awslimit.STS))
+			}),
+			roleARN,
+		),
 	)
 	return cfg, nil
 }
@@ -82,7 +89,9 @@ func FetchMasterCredentials(ctx context.Context, dbInstanceIdentifier string) (*
 		return nil, err
 	}
 
-	rdsClient := awsrds.NewFromConfig(cfg)
+	rdsClient := awsrds.NewFromConfig(cfg, func(o *awsrds.Options) {
+		o.APIOptions = append(o.APIOptions, awslimit.StackOption(awslimit.RDS))
+	})
 	out, err := rdsClient.DescribeDBInstances(ctx, &awsrds.DescribeDBInstancesInput{
 		DBInstanceIdentifier: aws.String(dbInstanceIdentifier),
 	})
@@ -102,7 +111,9 @@ func FetchMasterCredentials(ctx context.Context, dbInstanceIdentifier string) (*
 	}
 
 	secretARN := aws.ToString(inst.MasterUserSecret.SecretArn)
-	sm := secretsmanager.NewFromConfig(cfg)
+	sm := secretsmanager.NewFromConfig(cfg, func(o *secretsmanager.Options) {
+		o.APIOptions = append(o.APIOptions, awslimit.StackOption(awslimit.SecretsManager))
+	})
 	sec, err := sm.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
 		SecretId: aws.String(secretARN),
 	})
