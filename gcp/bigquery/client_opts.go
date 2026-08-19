@@ -94,18 +94,29 @@ func WithWriteDisposition(disposition string) clientOpt {
 func WithIAMClient(iamClient *iam.IdentityFederationClient) clientOpt {
 	return func(c *Client) error {
 		c.iamClient = iamClient
+		c.ownsIAM = false
 		return nil
 	}
 }
 
 func WithAutoIAMFederation(gcpProjectID, gcpProjectNum string, opts ...iam.Option) clientOpt {
 	return func(c *Client) error {
-		// Create IAM federation client with provided options
 		iamClient, err := iam.NewIdentityFederationClient(c.ctx, gcpProjectID, gcpProjectNum, opts...)
 		if err != nil {
 			return fmt.Errorf("failed to create IAM federation client: %w", err)
 		}
 		c.iamClient = iamClient
+		c.ownsIAM = true
+		c.gcpProjectNumber = gcpProjectNum
+		return nil
+	}
+}
+
+// WithGCPProjectNumber sets the numeric project id used when NewClient
+// auto-creates an IdentityFederationClient. Empty falls back to GCP_PROJECT_NUMBER.
+func WithGCPProjectNumber(projectNumber string) clientOpt {
+	return func(c *Client) error {
+		c.gcpProjectNumber = projectNumber
 		return nil
 	}
 }

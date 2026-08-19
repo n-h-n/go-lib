@@ -3,6 +3,8 @@ package bigquery
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/bigquery"
@@ -22,6 +24,8 @@ type Client struct {
 	datasetID         string
 	location          string
 	iamClient         *iam.IdentityFederationClient
+	ownsIAM           bool
+	gcpProjectNumber  string
 	credentialsJSON   string
 	verboseMode       bool
 	jobTimeout        int
@@ -59,6 +63,19 @@ func NewClient(
 		rateConfig:        DefaultRateConfig,
 	}
 
+	ok := false
+	defer func() {
+		if ok {
+			return
+		}
+		if c.client != nil {
+			_ = c.client.Close()
+		}
+		if c.ownsIAM && c.iamClient != nil {
+			_ = c.iamClient.Close(context.Background())
+		}
+	}()
+
 	for _, opt := range opts {
 		err := opt(&c)
 		if err != nil {
@@ -76,28 +93,9 @@ func NewClient(
 		return nil, fmt.Errorf("invalid dataset ID: %w", err)
 	}
 
-	var clientOptions []option.ClientOption
-
-	// Handle authentication
-	if c.credentialsJSON != "" {
-		// Use credentials JSON
-		creds, err := google.CredentialsFromJSON(ctx, []byte(c.credentialsJSON), bigquery.Scope)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create credentials from JSON: %w", err)
-		}
-		clientOptions = append(clientOptions, option.WithCredentials(creds))
-	} else if c.iamClient != nil {
-		// Use IAM federation client
-		tokenSource, err := c.iamClient.GetTokenSource(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get token source: %w", err)
-		}
-		clientOptions = append(clientOptions, option.WithTokenSource(tokenSource))
-	} else {
-		// Use default credentials (Application Default Credentials)
-		if c.verboseMode {
-			log.Log.Debugf(ctx, "using default credentials for BigQuery authentication")
-		}
+	clientOptions, err := c.authOptions(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	c.rateLimiter = newRateLimiter(
@@ -125,7 +123,57 @@ func NewClient(
 		log.Log.Debugf(ctx, "successfully connected to BigQuery project: %s, dataset: %s", c.projectID, c.datasetID)
 	}
 
+	ok = true
 	return &c, nil
+}
+
+// authOptions returns GCP client options authenticated via IAM federation
+// (default) or an explicit service-account JSON override.
+func (c *Client) authOptions(ctx context.Context) ([]option.ClientOption, error) {
+	if c.credentialsJSON != "" {
+		creds, err := google.CredentialsFromJSON(ctx, []byte(c.credentialsJSON), bigquery.Scope)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create credentials from JSON: %w", err)
+		}
+		return []option.ClientOption{option.WithCredentials(creds)}, nil
+	}
+
+	if c.iamClient == nil {
+		iamClient, err := newFederationClient(ctx, c.projectID, c.gcpProjectNumber, c.verboseMode)
+		if err != nil {
+			return nil, err
+		}
+		c.iamClient = iamClient
+		c.ownsIAM = true
+	}
+
+	tokenSource, err := c.iamClient.GetTokenSource(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get token source: %w", err)
+	}
+	if c.verboseMode {
+		log.Log.Debugf(ctx, "using IAM federation token source for BigQuery authentication")
+	}
+	return []option.ClientOption{option.WithTokenSource(tokenSource)}, nil
+}
+
+func newFederationClient(ctx context.Context, projectID, projectNumber string, verbose bool) (*iam.IdentityFederationClient, error) {
+	projectID = strings.TrimSpace(projectID)
+	projectNumber = strings.TrimSpace(projectNumber)
+	if projectID == "" {
+		projectID = strings.TrimSpace(os.Getenv(iam.GCP_PROJECT_ID))
+	}
+	if projectNumber == "" {
+		projectNumber = strings.TrimSpace(os.Getenv(iam.GCP_PROJECT_NUMBER))
+	}
+	if projectID == "" || projectNumber == "" {
+		return nil, fmt.Errorf("bigquery: IAM federation requires GCP project ID and number (or WithIAMClient / WithCredentialsJSON)")
+	}
+	iamClient, err := iam.NewIdentityFederationClient(ctx, projectID, projectNumber, iam.WithVerbose(verbose))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create IAM federation client: %w", err)
+	}
+	return iamClient, nil
 }
 
 // GetClient returns the underlying BigQuery client
@@ -169,27 +217,16 @@ func (c *Client) RefreshAuth(ctx context.Context) error {
 		log.Log.Debugf(ctx, "refreshing BigQuery authentication")
 	}
 
-	var clientOptions []option.ClientOption
-
-	// Handle authentication refresh
 	if c.credentialsJSON != "" {
-		// Credentials JSON doesn't need refresh
 		if c.verboseMode {
 			log.Log.Debugf(ctx, "credentials JSON authentication doesn't require refresh")
 		}
 		return nil
-	} else if c.iamClient != nil {
-		// Get fresh token source from IAM federation client
-		tokenSource, err := c.iamClient.GetTokenSource(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to refresh token source: %w", err)
-		}
-		clientOptions = append(clientOptions, option.WithTokenSource(tokenSource))
-	} else {
-		// Use default credentials (Application Default Credentials)
-		if c.verboseMode {
-			log.Log.Debugf(ctx, "using default credentials for BigQuery authentication refresh")
-		}
+	}
+
+	clientOptions, err := c.authOptions(ctx)
+	if err != nil {
+		return err
 	}
 
 	// Create new client with fresh authentication
@@ -212,12 +249,18 @@ func (c *Client) RefreshAuth(ctx context.Context) error {
 	return nil
 }
 
-// Close closes the BigQuery client
+// Close closes the BigQuery client and any federation client NewClient created.
 func (c *Client) Close() error {
+	var first error
 	if c.client != nil {
-		return c.client.Close()
+		first = c.client.Close()
 	}
-	return nil
+	if c.ownsIAM && c.iamClient != nil {
+		if err := c.iamClient.Close(context.Background()); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 // GetTableReference returns a table reference for the given table name
